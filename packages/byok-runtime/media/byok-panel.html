@@ -460,7 +460,7 @@
           <div class="form-group">
             <label class="form-label" for="select-active-provider">默认 Provider (activeProviderId)</label>
             <select id="select-active-provider"></select>
-            <div class="text-muted text-xs">未设置时：按 Providers 列表顺序自动选第一个；可按 endpoint 覆盖。</div>
+            <div class="text-muted text-xs">未设置时：按 Providers 列表顺序自动选第一个；每个 endpoint 可配置 enabled/providerId/model（chat/chat-stream 的 providerId/model 由主面板 Model Picker 专属控制）。</div>
           </div>
         </div>
         <div class="table-responsive">
@@ -474,7 +474,7 @@
             <thead>
               <tr>
                 <th>Endpoint</th>
-                <th>模式</th>
+                <th>状态</th>
                 <th>Provider</th>
                 <th>Model</th>
               </tr>
@@ -482,22 +482,6 @@
             <tbody id="tbody-routing">
               </tbody>
           </table>
-        </div>
-      </div>
-    </section>
-
-    <section class="settings-panel">
-      <header class="settings-panel__header">全局默认参数</header>
-      <div class="settings-panel__body">
-        <div class="form-grid">
-          <div class="form-group">
-            <label class="form-label" for="input-default-temp">默认 Temperature</label>
-            <input type="number" id="input-default-temp" step="0.1" placeholder="例如: 0.2" />
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="input-default-max">默认 MaxTokens</label>
-            <input type="number" id="input-default-max" step="1" placeholder="留空为自动" />
-          </div>
         </div>
       </div>
     </section>

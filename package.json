@@ -7,13 +7,14 @@
   "scripts": {
     "build:payload": "node tools/entry/payload-build/build-payload.js",
     "build:vsix": "node tools/entry/payload-build/build-payload.js && node tools/entry/vsix-build-pipeline/build-vsix.js",
+    "clean:cache": "node tools/entry/vsix-build-pipeline/clean-cache.js",
     "upstream:sync": "node tools/entry/vsix-upstream-sync/sync.js",
     "upstream:analyze": "node tools/entry/upstream-analysis/analyze.js",
     "check:matrix": "node tools/entry/endpoint-coverage/endpoint-coverage.js",
     "check:get-models": "node tools/entry/get-models-audit/get-models-report.js",
-    "check:get-models:acemcp": "node tools/entry/get-models-audit/get-models-report.js --base-url https://acemcp.heroman.wtf/relay/ --token ace_ada5efed41203b3e6711d60038f594ce23a39124",
+    "check:get-models:acemcp": "node tools/entry/get-models-audit/get-models-report.js --base-url https://acemcp.heroman.wtf/relay/ --token-env ACEMCP_TOKEN",
     "test:relay": "node tools/entry/relay-profiles/relay-smoke.js",
-    "test:relay:acemcp": "node tools/entry/relay-profiles/relay-smoke.js --profile config/relay-profiles/acemcp-heroman-relay.json --base-url https://acemcp.heroman.wtf/relay/ --token ace_ada5efed41203b3e6711d60038f594ce23a39124"
+    "test:relay:acemcp": "node tools/entry/relay-profiles/relay-smoke.js --profile config/relay-profiles/acemcp-heroman-relay.json --base-url https://acemcp.heroman.wtf/relay/ --token-env ACEMCP_TOKEN"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

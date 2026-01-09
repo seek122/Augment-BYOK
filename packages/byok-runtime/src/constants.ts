@@ -4,7 +4,7 @@ export const AUGMENT_BYOK = {
   memoriesFileName: "Augment-Memories",
   byokPanelPatchedGlobalKey: "__augment_byok_panel_patched",
   extensionContextGlobalKey: "__augment_byok_extension_context",
-  byokConfigGlobalStateKey: "__augment_byok_config_v1",
-  byokModelsCacheGlobalStateKey: "__augment_byok_models_cache_v1",
-  byokSecretPrefix: "__augment_byok_secret_v1"
+  byokConfigGlobalStateKey: "__augment_byok_config_v2",
+  byokModelsCacheGlobalStateKey: "__augment_byok_models_cache_v2",
+  byokSecretPrefix: "__augment_byok_secret_v2"
 } as const;

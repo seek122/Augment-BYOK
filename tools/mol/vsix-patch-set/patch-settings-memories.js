@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { ensureMarker } = require("../../atom/common/patch");
 
 const MARKER = "__augment_byok_settings_memories_webview_patched";
 
@@ -246,13 +247,6 @@ function replaceAsyncMethod(src, methodName, replacementFactory) {
   return { src: next, changed: true, reason: "patched" };
 }
 
-function ensureMarker(src) {
-  if (src.includes(MARKER)) return src;
-  const sm = src.lastIndexOf("//# sourceMappingURL=");
-  if (sm >= 0) return src.slice(0, sm) + `;/*${MARKER}*/\n` + src.slice(sm);
-  return src + `\n;/*${MARKER}*/\n`;
-}
-
 function patchFile(filePath, { checkOnly }) {
   const original = fs.readFileSync(filePath, "utf8");
   let src = original;
@@ -285,7 +279,7 @@ function patchFile(filePath, { checkOnly }) {
 
   if (!didChange) return { filePath, changed: false, patched };
 
-  src = ensureMarker(src);
+  src = ensureMarker(src, MARKER);
   fs.writeFileSync(filePath, src, "utf8");
 
   if (shouldHavePatched && !patched) throw new Error(`Patch failed for ${path.basename(filePath)} (methods not updated)`);

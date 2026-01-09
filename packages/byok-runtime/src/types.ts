@@ -13,25 +13,23 @@ export type ByokProvider = {
   defaultModel?: string;
 };
 
-export type ByokRouting = {
+export type ByokRoutingRule = {
+  enabled?: boolean;
+  providerId?: string;
+  model?: string;
+};
+
+export type ByokRoutingV2 = {
   activeProviderId: string;
-  routes?: Record<string, string>;
-  models?: Record<string, string>;
+  rules?: Record<string, ByokRoutingRule>;
 };
 
-export type ByokDefaults = {
-  requestTimeoutMs?: number;
-  temperature?: number;
-  maxTokens?: number;
-};
-
-export type ByokConfigV1 = {
-  version: 1;
+export type ByokConfigV2 = {
+  version: 2;
   enabled?: boolean;
   proxy?: { baseUrl: string };
   providers: ByokProvider[];
-  routing: ByokRouting;
-  defaults?: ByokDefaults;
+  routing: ByokRoutingV2;
 };
 
 export type ByokProviderSecrets = {
@@ -41,17 +39,14 @@ export type ByokProviderSecrets = {
 
 export type ByokResolvedProvider = ByokProvider & { secrets: ByokProviderSecrets };
 
-export type ByokResolvedDefaults = ByokDefaults & { requestTimeoutMs: number };
-
-export type ByokResolvedConfigV1 = Omit<ByokConfigV1, "defaults" | "providers"> & {
+export type ByokResolvedConfigV2 = Omit<ByokConfigV2, "providers" | "proxy"> & {
   providers: ByokResolvedProvider[];
-  defaults: ByokResolvedDefaults;
   proxy: { baseUrl: string; token?: string };
 };
 
-export type ByokExportV1 = {
-  version: 1;
-  config: ByokConfigV1;
+export type ByokExportV2 = {
+  version: 2;
+  config: ByokConfigV2;
   secrets: { proxy: { token?: string | null }; providers: Record<string, { apiKey?: string | null; token?: string | null }> };
   meta: { exportedAt: string; redacted: boolean };
 };

@@ -1,12 +1,7 @@
 import { AUGMENT_BYOK } from "../../constants";
-import { normalizeString } from "../../atom/common/http";
-import type { ByokConfigV1, ByokDefaults, ByokExportV1, ByokProvider, ByokProviderSecrets, ByokResolvedConfigV1, ByokResolvedDefaults } from "../../types";
-
-const DEFAULTS: ByokResolvedDefaults = { requestTimeoutMs: 120_000 };
-
-function asRecord(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
-}
+import { normalizeEndpoint, normalizeString } from "../../atom/common/http";
+import { asRecord } from "../../atom/common/object";
+import type { ByokConfigV2, ByokExportV2, ByokProvider, ByokProviderSecrets, ByokResolvedConfigV2, ByokRoutingRule } from "../../types";
 
 function normalizeProvider(v: unknown): ByokProvider | null {
   const r = asRecord(v);
@@ -20,33 +15,40 @@ function normalizeProvider(v: unknown): ByokProvider | null {
   return { id, type, baseUrl, defaultModel };
 }
 
-function normalizeConfigV1(v: unknown): ByokConfigV1 {
+function normalizeRoutingRule(v: unknown): ByokRoutingRule | null {
   const r = asRecord(v);
-  const version = r?.version === 1 ? 1 : 1;
-  const enabled = typeof r?.enabled === "boolean" ? r.enabled : false;
-  const proxyRaw = asRecord(r?.proxy) || {};
+  if (!r) return null;
+  const enabled = typeof r.enabled === "boolean" ? r.enabled : undefined;
+  const providerId = normalizeString(r.providerId) || undefined;
+  const model = normalizeString(r.model) || undefined;
+  const out: ByokRoutingRule = {};
+  if (enabled === false) out.enabled = false;
+  if (providerId) out.providerId = providerId;
+  if (model) out.model = model;
+  return Object.keys(out).length ? out : null;
+}
+
+function normalizeConfigV2(v: unknown): ByokConfigV2 {
+  const r = asRecord(v);
+  if (!r || r.version !== 2) return { version: 2, enabled: false, proxy: { baseUrl: "" }, providers: [], routing: { activeProviderId: "", rules: undefined } };
+  const enabled = typeof r.enabled === "boolean" ? r.enabled : false;
+  const proxyRaw = asRecord(r.proxy) || {};
   const proxyBaseUrl = normalizeString(proxyRaw.baseUrl);
-  const providersRaw = Array.isArray(r?.providers) ? (r?.providers as unknown[]) : [];
+  const providersRaw = Array.isArray(r.providers) ? (r.providers as unknown[]) : [];
   const providers = providersRaw.map(normalizeProvider).filter(Boolean) as ByokProvider[];
-  const routingRaw = asRecord(r?.routing) || {};
+  const routingRaw = asRecord(r.routing) || {};
   const activeProviderId = normalizeString(routingRaw.activeProviderId);
-  const routesRaw = asRecord(routingRaw.routes);
-  const routes: Record<string, string> | undefined = routesRaw
-    ? Object.fromEntries(Object.entries(routesRaw).map(([k, vv]) => [String(k), normalizeString(vv)]).filter(([, vv]) => Boolean(vv)))
+  const rulesRaw = asRecord(routingRaw.rules);
+  const rules: Record<string, ByokRoutingRule> | undefined = rulesRaw
+    ? Object.fromEntries(
+        Object.entries(rulesRaw)
+          .map(([k, vv]) => [normalizeEndpoint(k), normalizeRoutingRule(vv)] as const)
+          .filter(([k, vv]) => Boolean(k) && Boolean(vv))
+          .map(([k, vv]) => [k, vv as ByokRoutingRule])
+      )
     : undefined;
-  const modelsRaw = asRecord(routingRaw.models);
-  const models: Record<string, string> | undefined = modelsRaw
-    ? Object.fromEntries(Object.entries(modelsRaw).map(([k, vv]) => [String(k), normalizeString(vv)]).filter(([, vv]) => Boolean(vv)))
-    : undefined;
-  const defaultsRaw = asRecord(r?.defaults);
-  const requestTimeoutMs = Number(defaultsRaw?.requestTimeoutMs);
-  const temperature = Number(defaultsRaw?.temperature);
-  const maxTokens = Number(defaultsRaw?.maxTokens);
-  const defaults: ByokDefaults = {};
-  if (Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0) defaults.requestTimeoutMs = requestTimeoutMs;
-  if (Number.isFinite(temperature)) defaults.temperature = temperature;
-  if (Number.isFinite(maxTokens) && maxTokens > 0) defaults.maxTokens = maxTokens;
-  return { version, enabled, proxy: { baseUrl: proxyBaseUrl }, providers, routing: { activeProviderId, routes, models }, defaults: Object.keys(defaults).length ? defaults : undefined };
+  const outRules = rules && Object.keys(rules).length ? rules : undefined;
+  return { version: 2, enabled, proxy: { baseUrl: proxyBaseUrl }, providers, routing: { activeProviderId, rules: outRules } };
 }
 
 function secretKey(providerId: string, field: keyof ByokProviderSecrets): string {
@@ -80,13 +82,13 @@ function assertContextStorage(context: any): void {
   if (!okGlobalState || !okSecrets) throw new Error("BYOK 安全存储不可用（缺少 globalState / secrets）");
 }
 
-export async function loadByokConfigRaw({ context }: { context: any }): Promise<ByokConfigV1> {
+export async function loadByokConfigRaw({ context }: { context: any }): Promise<ByokConfigV2> {
   assertContextStorage(context);
   const stored = await context.globalState.get(AUGMENT_BYOK.byokConfigGlobalStateKey);
-  return normalizeConfigV1(stored);
+  return normalizeConfigV2(stored);
 }
 
-export async function loadByokConfigResolved({ context, env = process.env }: { context: any; env?: NodeJS.ProcessEnv }): Promise<ByokResolvedConfigV1> {
+export async function loadByokConfigResolved({ context, env = process.env }: { context: any; env?: NodeJS.ProcessEnv }): Promise<ByokResolvedConfigV2> {
   assertContextStorage(context);
   const config = await loadByokConfigRaw({ context });
   const proxyTokenRaw = normalizeString(await context.secrets.get(proxySecretKey("token")));
@@ -103,8 +105,7 @@ export async function loadByokConfigResolved({ context, env = process.env }: { c
   return {
     ...config,
     proxy: { baseUrl: normalizeString(config.proxy?.baseUrl), token: proxyToken || undefined },
-    providers,
-    defaults: { ...DEFAULTS, ...(config.defaults || {}) }
+    providers
   };
 }
 
@@ -116,13 +117,14 @@ export async function saveByokConfig({
   secretsByProviderId
 }: {
   context: any;
-  config: ByokConfigV1;
+  config: ByokConfigV2;
   proxyToken?: string;
   clearProxyToken?: boolean;
   secretsByProviderId?: Record<string, ByokProviderSecrets | undefined>;
 }): Promise<void> {
   assertContextStorage(context);
-  const nextConfig = normalizeConfigV1(config);
+  if (!(asRecord(config)?.version === 2)) throw new Error(`配置版本不匹配：${String(asRecord(config)?.version)}`);
+  const nextConfig = normalizeConfigV2(config);
   await context.globalState.update(AUGMENT_BYOK.byokConfigGlobalStateKey, nextConfig);
   if (typeof proxyToken === "string") await context.secrets.store(proxySecretKey("token"), proxyToken);
   else if (clearProxyToken) await context.secrets.delete(proxySecretKey("token"));
@@ -145,13 +147,13 @@ export async function exportByokConfig({
 }: {
   context: any;
   includeSecrets?: boolean;
-}): Promise<ByokExportV1> {
+}): Promise<ByokExportV2> {
   assertContextStorage(context);
   const config = await loadByokConfigRaw({ context });
   const exportedAt = new Date().toISOString();
   const proxyTokenRaw = normalizeString(await context.secrets.get(proxySecretKey("token")));
   const proxyToken = includeSecrets ? proxyTokenRaw || null : parseEnvPlaceholder(proxyTokenRaw || "") ? proxyTokenRaw : proxyTokenRaw ? null : undefined;
-  const secrets: ByokExportV1["secrets"] = { proxy: { token: proxyToken ?? undefined }, providers: {} };
+  const secrets: ByokExportV2["secrets"] = { proxy: { token: proxyToken ?? undefined }, providers: {} };
   await Promise.all(
     config.providers.map(async (p) => {
       const apiKeyRaw = normalizeString(await context.secrets.get(secretKey(p.id, "apiKey")));
@@ -161,7 +163,7 @@ export async function exportByokConfig({
       if (apiKey !== undefined || token !== undefined) secrets.providers[p.id] = { apiKey: apiKey ?? undefined, token: token ?? undefined };
     })
   );
-  return { version: 1, config, secrets, meta: { exportedAt, redacted: !includeSecrets } };
+  return { version: 2, config, secrets, meta: { exportedAt, redacted: !includeSecrets } };
 }
 
 export async function importByokConfig({
@@ -176,8 +178,10 @@ export async function importByokConfig({
   assertContextStorage(context);
   const r = asRecord(data);
   if (!r) throw new Error("导入失败：格式不是对象");
-  if (r.version !== 1) throw new Error(`导入失败：不支持的版本：${String(r.version)}`);
-  const config = normalizeConfigV1(r.config);
+  if (r.version !== 2) throw new Error(`导入失败：不支持的版本：${String(r.version)}`);
+  const configRaw = asRecord(r.config);
+  if (!configRaw || configRaw.version !== 2) throw new Error(`导入失败：config.version 不匹配：${String(configRaw?.version)}`);
+  const config = normalizeConfigV2(configRaw);
   await context.globalState.update(AUGMENT_BYOK.byokConfigGlobalStateKey, config);
   const secretsRoot = asRecord(r.secrets) || {};
   const proxySecrets = asRecord(secretsRoot.proxy) || {};

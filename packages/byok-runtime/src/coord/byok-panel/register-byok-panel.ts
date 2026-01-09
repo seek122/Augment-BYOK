@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { exportByokConfig, importByokConfig, loadByokConfigRaw, loadByokConfigResolved, parseEnvPlaceholder, resolveSecretOrThrow, saveByokConfig } from "../../mol/byok-storage/byok-config";
@@ -12,10 +13,7 @@ const VIEW_TYPE = "augmentByokPanel";
 const TITLE = "Augment BYOK";
 
 function nonce(): string {
-  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let out = "";
-  for (let i = 0; i < 32; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
-  return out;
+  return crypto.randomBytes(24).toString("base64");
 }
 
 function readExtensionAssetFile(context: any, fileName: string): string {
@@ -61,19 +59,21 @@ async function testProxy({ context }: { context: any }): Promise<{ ok: boolean; 
   const auth = buildBearerAuthHeader(cfg.proxy.token);
   if (!auth) throw new Error("Token 未配置");
   const resp = await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: auth }, body: "{}", signal: AbortSignal.timeout(8000) });
-  const ok = resp.status !== 401 && resp.status !== 404;
+  const ok = resp.ok;
   return { ok, status: resp.status };
 }
 
 async function listModels({
   context,
   providerId,
+  providerType,
   baseUrl,
   apiKey,
   env = process.env
 }: {
   context: any;
   providerId: string;
+  providerType?: string;
   baseUrl?: string;
   apiKey?: string;
   env?: NodeJS.ProcessEnv;
@@ -81,26 +81,28 @@ async function listModels({
   const cfg = await loadByokConfigResolved({ context, env });
   const pid = normalizeString(providerId);
   if (!pid) throw new Error("缺少 providerId");
-  const p = cfg.providers.find((x) => x.id === pid);
-  if (!p) throw new Error(`未知 Provider: ${pid}`);
-  const b = normalizeString(baseUrl) || normalizeString(p.baseUrl);
+  const saved = cfg.providers.find((x) => x.id === pid) || null;
+  const ptype = normalizeString(saved?.type) || normalizeString(providerType);
+  if (ptype !== "openai_compatible" && ptype !== "anthropic_native") throw new Error(saved ? `Provider(${pid}) type 无效` : `未知 Provider: ${pid}（请先保存或传入 providerType）`);
+  const b = normalizeString(baseUrl) || normalizeString(saved?.baseUrl);
   if (!b) throw new Error(`Provider(${pid}) 缺少 baseUrl`);
-  const rawKey = normalizeString(apiKey) || normalizeString(p.secrets.apiKey || p.secrets.token || "");
+  assertHttpBaseUrl(b);
+  const rawKey = normalizeString(apiKey) || normalizeString(saved?.secrets.apiKey || saved?.secrets.token || "");
   const key = rawKey ? resolveSecretOrThrow(rawKey, env) : "";
   if (!key) throw new Error(`Provider(${pid}) 缺少 apiKey/token`);
   const timeoutMs = 12_000;
 
-  if (p.type === "openai_compatible") {
+  if (ptype === "openai_compatible") {
     const models = await openAiListModels({ baseUrl: b, apiKey: key, timeoutMs });
     await saveCachedProviderModels({ context, providerId: pid, baseUrl: b, models });
     return { models };
   }
-  if (p.type === "anthropic_native") {
+  if (ptype === "anthropic_native") {
     const models = await anthropicListModels({ baseUrl: b, apiKey: key, timeoutMs });
     await saveCachedProviderModels({ context, providerId: pid, baseUrl: b, models });
     return { models };
   }
-  throw new Error(`未知 Provider type: ${String((p as any).type)}`);
+  throw new Error(`未知 Provider type: ${ptype}`);
 }
 
 export function registerByokPanel({ vscode, context, logger = console }: { vscode: any; context: any; logger?: Console }): void {
@@ -175,7 +177,9 @@ export function registerByokPanel({ vscode, context, logger = console }: { vscod
               const providersModelsCache: Record<string, { updatedAtMs: number; models: string[] }> = {};
               for (const p of config.providers) {
                 const apiKeyRaw = normalizeString(await context.secrets.get(`${AUGMENT_BYOK.byokSecretPrefix}.provider.${p.id}.apiKey`));
-                providersStatus[p.id] = { apiKey: !apiKeyRaw ? "missing" : parseEnvPlaceholder(apiKeyRaw) ? "env" : "set" };
+                const tokenRaw = normalizeString(await context.secrets.get(`${AUGMENT_BYOK.byokSecretPrefix}.provider.${p.id}.token`));
+                const raw = apiKeyRaw || tokenRaw;
+                providersStatus[p.id] = { apiKey: !raw ? "missing" : parseEnvPlaceholder(raw) ? "env" : "set" };
                 const cached = modelsCache.providers[p.id];
                 if (cached && normalizeString(cached.baseUrl).replace(/\/+$/, "") === normalizeString(p.baseUrl).replace(/\/+$/, "")) {
                   providersModelsCache[p.id] = { updatedAtMs: cached.updatedAtMs, models: cached.models };
@@ -192,6 +196,18 @@ export function registerByokPanel({ vscode, context, logger = console }: { vscod
               const providerSecretsById = params && typeof params === "object" ? (params as any).providerSecretsById : null;
               const enabled = Boolean(cfg && typeof cfg === "object" ? (cfg as any).enabled : false);
               if (enabled) {
+                const providers = Array.isArray(cfg && typeof cfg === "object" ? (cfg as any).providers : null) ? (cfg as any).providers : [];
+                if (!providers.length) throw new Error("启用 BYOK 需要至少一个 Provider");
+                for (const p of providers) {
+                  const pid = normalizeString(p && typeof p === "object" ? (p as any).id : "");
+                  const ptype = normalizeString(p && typeof p === "object" ? (p as any).type : "");
+                  const pbaseUrl = normalizeString(p && typeof p === "object" ? (p as any).baseUrl : "");
+                  const pdefaultModel = normalizeString(p && typeof p === "object" ? (p as any).defaultModel : "");
+                  if (!pid) throw new Error("启用 BYOK 需要有效的 Provider.id");
+                  if (ptype !== "openai_compatible" && ptype !== "anthropic_native") throw new Error(`Provider(${pid}) type 无效`);
+                  assertHttpBaseUrl(pbaseUrl);
+                  if (!pdefaultModel) throw new Error(`Provider(${pid}) 缺少 defaultModel`);
+                }
                 assertHttpBaseUrl(cfg && typeof cfg === "object" ? (cfg as any)?.proxy?.baseUrl : "");
                 const storedRaw = normalizeString(await context.secrets.get(`${AUGMENT_BYOK.byokSecretPrefix}.proxy.token`));
                 const nextTokenRaw = proxyToken ? proxyToken : clearProxyToken ? "" : storedRaw;
@@ -240,9 +256,10 @@ export function registerByokPanel({ vscode, context, logger = console }: { vscod
 
             if (method === "listModels") {
               const providerId = normalizeString(params && typeof params === "object" ? (params as any).providerId : "");
+              const providerType = normalizeString(params && typeof params === "object" ? (params as any).providerType : "");
               const baseUrl = normalizeString(params && typeof params === "object" ? (params as any).baseUrl : "");
               const apiKey = normalizeString(params && typeof params === "object" ? (params as any).apiKey : "");
-              const r = await listModels({ context, providerId, baseUrl: baseUrl || undefined, apiKey: apiKey || undefined });
+              const r = await listModels({ context, providerId, providerType: providerType || undefined, baseUrl: baseUrl || undefined, apiKey: apiKey || undefined });
               await post(requestId, { ok: true, result: r });
               return;
             }

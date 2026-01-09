@@ -14,9 +14,8 @@ const {
   topSegment
 } = require("../../atom/upstream-analysis");
 
-function readJson(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
+const { ensureDir, rmDir, readJson, writeJson, writeText } = require("../../atom/common/fs");
+const { syncUpstreamLatest } = require("../../atom/vsix-upstream-sync");
 
 function toSupportedSet(profile) {
   const allowed = Array.isArray(profile?.allowedPaths) ? profile.allowedPaths : [];
@@ -66,11 +65,7 @@ function loadUpstreamFromAnalysisOrUnpack({ repoRoot, analysisPath, unpackDir })
   const extensionJsPath = path.join(unpackDir, "extension", "out", "extension.js");
   const extensionPkgPath = path.join(unpackDir, "extension", "package.json");
 
-  if (!fs.existsSync(extensionJsPath)) {
-    console.error(`[check] upstream not synced; run: pnpm upstream:sync`);
-    console.error(`[check] then run: pnpm upstream:analyze (to generate .cache/reports/upstream-analysis.json)`);
-    process.exit(1);
-  }
+  if (!fs.existsSync(extensionJsPath)) throw new Error(`upstream unpack missing: ${path.relative(repoRoot, extensionJsPath)}`);
 
   const src = fs.readFileSync(extensionJsPath, "utf8");
   const { endpoints, endpointDetails } = extractUpstreamApiCallsFromExtensionJs(src);
@@ -89,16 +84,22 @@ function loadUpstreamFromAnalysisOrUnpack({ repoRoot, analysisPath, unpackDir })
   };
 }
 
-function main() {
+async function main() {
   const repoRoot = path.resolve(__dirname, "../../..");
+  const cacheDir = path.join(repoRoot, ".cache");
+  const keepWorkDir = process.env.AUGMENT_BYOK_KEEP_WORKDIR === "1";
   const args = parseArgs(process.argv.slice(2));
   const profilePath = args.profile ? path.resolve(repoRoot, args.profile) : path.join(repoRoot, "config", "relay-profiles", "acemcp-heroman-relay.json");
   const llmPath = args.llm ? path.resolve(repoRoot, args.llm) : path.join(repoRoot, "config", "byok-routing", "llm-endpoints.json");
   const analysisPath = args.analysis ? path.resolve(repoRoot, args.analysis) : path.join(repoRoot, ".cache", "reports", "upstream-analysis.json");
-  const unpackDir = args.unpackDir ? path.resolve(repoRoot, args.unpackDir) : path.join(repoRoot, ".cache", "upstream", "unpacked", "latest");
+  const usingProvidedUnpackDir = Boolean(args.unpackDir);
+  const unpackDir = usingProvidedUnpackDir ? path.resolve(repoRoot, args.unpackDir) : path.join(cacheDir, "work", "endpoint-coverage");
 
   if (!fs.existsSync(profilePath)) throw new Error(`missing profile: ${path.relative(repoRoot, profilePath)}`);
   if (!fs.existsSync(llmPath)) throw new Error(`missing llm endpoints: ${path.relative(repoRoot, llmPath)}`);
+
+  const usingAnalysis = Boolean(analysisPath && fs.existsSync(analysisPath));
+  if (!usingAnalysis && !usingProvidedUnpackDir) await syncUpstreamLatest({ repoRoot, cacheDir, loggerPrefix: "[check]", unpackDir, writeMeta: false });
 
   const profile = readJson(profilePath);
   const supported = toSupportedSet(profile);
@@ -108,7 +109,8 @@ function main() {
   const llmEndpoints = llmEndpointsRaw.map(normalizePath).filter(Boolean);
   const llmSet = new Set(llmEndpoints);
 
-  const localHandled = new Set(LOCAL_HANDLED_ENDPOINTS);
+  const localHandled = new Set([...LOCAL_HANDLED_ENDPOINTS, ...llmEndpoints]);
+  const localHandledList = Array.from(localHandled).sort();
 
   const upstream = loadUpstreamFromAnalysisOrUnpack({ repoRoot, analysisPath, unpackDir });
   const upstreamEndpoints = upstream.endpoints;
@@ -133,7 +135,7 @@ function main() {
 
   const reportPath = path.join(repoRoot, ".cache", "reports", "endpoint-coverage.report.json");
   const reportMdPath = path.join(repoRoot, ".cache", "reports", "endpoint-coverage.report.md");
-  fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+  ensureDir(path.dirname(reportPath));
 
   const missingFromProfileDetails = missingFromProfile.map((ep) => {
     const d = upstream.endpointDetails[ep] || { callApi: { count: 0, samples: [] }, callApiStream: { count: 0, samples: [] } };
@@ -147,10 +149,10 @@ function main() {
       version: upstream.version,
       source: upstream.source,
       referencedEndpointCount: upstreamEndpoints.length,
-      unpackDir: path.relative(repoRoot, unpackDir)
+      unpackDir: upstream.source.kind === "analysis" ? "" : path.relative(repoRoot, unpackDir)
     },
     llm: { path: path.relative(repoRoot, llmPath), endpointCount: llmEndpoints.length, endpoints: llmEndpoints },
-    localHandled: { endpointCount: LOCAL_HANDLED_ENDPOINTS.length, endpoints: LOCAL_HANDLED_ENDPOINTS },
+    localHandled: { endpointCount: localHandledList.length, endpoints: localHandledList },
     referencedEndpoints: upstreamEndpoints,
     missingFromProfile,
     missingFromProfileLlm,
@@ -166,11 +168,7 @@ function main() {
     contextKeyToFeatureFlags: upstream.contextKeyToFeatureFlags
   };
 
-  fs.writeFileSync(
-    reportPath,
-    JSON.stringify(reportJson, null, 2) + "\n",
-    "utf8"
-  );
+  writeJson(reportPath, reportJson);
   console.log(`[check] report: ${path.relative(repoRoot, reportPath)}`);
 
   const md = [
@@ -202,8 +200,13 @@ function main() {
     `- upstream 端点来源优先使用 ${path.relative(repoRoot, analysisPath)}（若存在），否则从解包的 extension/out/extension.js 抽取（不猜测字符串拼接）。`,
     `- local-handled endpoints 表示已通过补丁在本地实现，不要求 relay 支持。`
   ].join("\n");
-  fs.writeFileSync(reportMdPath, md + "\n", "utf8");
+  writeText(reportMdPath, md + "\n");
   console.log(`[check] report: ${path.relative(repoRoot, reportMdPath)}`);
+
+  if (!usingAnalysis && !usingProvidedUnpackDir && !keepWorkDir) rmDir(unpackDir);
 }
 
-main();
+main().catch((err) => {
+  console.error(`[check] ERROR:`, err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});

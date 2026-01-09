@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { ensureMarker } = require("../../atom/common/patch");
 
 const MARKER = "__augment_byok_api_endpoint_strip_leading_slash_patched";
 
@@ -16,7 +17,7 @@ function patchApiEndpointStripLeadingSlash(filePath) {
   const count = original.split(needle).length - 1;
   if (count <= 0) throw new Error(`failed to locate API URL join needle (upstream may have changed): ${needle}`);
 
-  const next = original.split(needle).join(replacement) + `\n;/*${MARKER}*/\n`;
+  const next = ensureMarker(original.split(needle).join(replacement), MARKER);
   fs.writeFileSync(filePath, next, "utf8");
   return { changed: true, reason: "patched", replaced: count };
 }

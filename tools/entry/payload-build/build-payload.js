@@ -3,22 +3,8 @@
 
 const fs = require("fs");
 const path = require("path");
-const { spawnSync } = require("child_process");
-
-function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function rmDir(dirPath) {
-  if (!fs.existsSync(dirPath)) return;
-  fs.rmSync(dirPath, { recursive: true, force: true });
-}
-
-function run(cmd, args, { cwd }) {
-  const r = spawnSync(cmd, args, { cwd, stdio: "inherit" });
-  if (r.error) throw r.error;
-  if (typeof r.status === "number" && r.status !== 0) throw new Error(`command failed: ${cmd} ${args.join(" ")}`);
-}
+const { ensureDir, rmDir } = require("../../atom/common/fs");
+const { run } = require("../../atom/vsix-upstream-sync");
 
 function main() {
   const repoRoot = path.resolve(__dirname, "../../..");

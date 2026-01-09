@@ -1,15 +1,14 @@
-import { loadByokConfigResolved } from "../../mol/byok-storage/byok-config";
+import { loadByokConfigRaw, loadByokConfigResolved } from "../../mol/byok-storage/byok-config";
 import { getCachedProviderModels, saveCachedProviderModels } from "../../mol/byok-routing/provider-models-cache";
 import { AUGMENT_BYOK } from "../../constants";
-import type { ByokResolvedConfigV1, ByokResolvedProvider } from "../../types";
+import type { ByokResolvedConfigV2, ByokResolvedProvider, ByokRoutingRule } from "../../types";
 import { buildAbortSignal, buildBearerAuthHeader, joinBaseUrl, normalizeEndpoint, normalizeString } from "../../atom/common/http";
+import { asRecord } from "../../atom/common/object";
 import { anthropicComplete, anthropicCompleteWithTools, anthropicListModels, anthropicStream, type AnthropicTool } from "../../atom/byok-providers/anthropic-native";
 import { openAiChatComplete, openAiChatCompleteWithTools, openAiChatStream, openAiListModels, type OpenAiTool } from "../../atom/byok-providers/openai-compatible";
 
-function asRecord(v: unknown): Record<string, any> {
-  return v && typeof v === "object" && !Array.isArray(v) ? (v as any) : {};
-}
-
+const BYOK_REQUEST_TIMEOUT_MS = 120_000;
+const BYOK_MODELS_TIMEOUT_MS = 12_000;
 
 function tryParseJsonObject(v: unknown): Record<string, any> | null {
   if (!v) return null;
@@ -90,12 +89,19 @@ async function listProviderModels(provider: ByokResolvedProvider, timeoutMs: num
   throw new Error(`未知 Provider type: ${String((provider as any).type)}`);
 }
 
-function pickProvider(cfg: ByokResolvedConfigV1, endpoint: string): ByokResolvedProvider {
-  const routes = cfg.routing?.routes && typeof cfg.routing.routes === "object" ? cfg.routing.routes : {};
-  const providerId = normalizeString(routes[endpoint] || "") || normalizeString(cfg.routing?.activeProviderId) || normalizeString(cfg.providers[0]?.id);
-  const p = cfg.providers.find((x) => x.id === providerId) || cfg.providers[0];
-  if (!p) throw new Error("未配置任何 Provider");
-  return p;
+function isChatEndpoint(endpoint: string): boolean {
+  return endpoint === "chat" || endpoint === "chat-stream";
+}
+
+function getRoutingRule(cfg: ByokResolvedConfigV2, endpoint: string): ByokRoutingRule | null {
+  const rules = cfg.routing?.rules && typeof cfg.routing.rules === "object" ? cfg.routing.rules : null;
+  const v = rules && typeof (rules as any)[endpoint] === "object" ? (rules as any)[endpoint] : null;
+  return v ? (v as ByokRoutingRule) : null;
+}
+
+function throwIfDisabledEndpoint(cfg: ByokResolvedConfigV2, endpoint: string): void {
+  const rule = getRoutingRule(cfg, endpoint);
+  if (rule?.enabled === false) throw new Error(`BYOK 已禁用的 endpoint: ${endpoint}`);
 }
 
 function parseByokModelId(model: string): { providerId: string; modelId: string } | null {
@@ -110,29 +116,44 @@ function parseByokModelId(model: string): { providerId: string; modelId: string 
   return { providerId, modelId };
 }
 
-function getProviderById(cfg: ByokResolvedConfigV1, providerId: string): ByokResolvedProvider {
+function pickActiveProvider(cfg: ByokResolvedConfigV2): ByokResolvedProvider {
+  const providerId = normalizeString(cfg.routing?.activeProviderId) || normalizeString(cfg.providers[0]?.id);
+  const p = (providerId && cfg.providers.find((x) => x.id === providerId)) || cfg.providers[0];
+  if (!p) throw new Error("未配置任何 Provider");
+  return p;
+}
+
+function getProviderById(cfg: ByokResolvedConfigV2, providerId: string): ByokResolvedProvider {
   const pid = normalizeString(providerId);
   const p = cfg.providers.find((x) => x.id === pid);
   if (!p) throw new Error(`未找到 Provider: ${pid}`);
   return p;
 }
 
-function resolveProviderAndModel(cfg: ByokResolvedConfigV1, endpoint: string, requestModel: string): { provider: ByokResolvedProvider; model: string } | null {
-  const reqModel = normalizeString(requestModel);
-  if (reqModel) {
-    const parsed = parseByokModelId(reqModel);
-    if (!parsed) return null;
-    return { provider: getProviderById(cfg, parsed.providerId), model: parsed.modelId };
-  }
-  const routed = normalizeString((cfg.routing as any)?.models?.[endpoint]);
-  if (routed) {
-    const parsed = parseByokModelId(routed);
+function resolveProviderAndModel(cfg: ByokResolvedConfigV2, endpoint: string, requestModel: string): { provider: ByokResolvedProvider; model: string } {
+  const rule = getRoutingRule(cfg, endpoint);
+
+  if (isChatEndpoint(endpoint)) {
+    const parsed = normalizeString(requestModel) ? parseByokModelId(requestModel) : null;
     if (parsed) return { provider: getProviderById(cfg, parsed.providerId), model: parsed.modelId };
-    return { provider: pickProvider(cfg, endpoint), model: routed };
+    const provider = pickActiveProvider(cfg);
+    const model = normalizeString(provider.defaultModel);
+    if (!model) throw new Error(`Provider(${provider.id}) 缺少 defaultModel（chat 未选择 byok model）`);
+    return { provider, model };
   }
-  const provider = pickProvider(cfg, endpoint);
+
+  const routedModel = normalizeString(rule?.model);
+  if (routedModel) {
+    const parsed = parseByokModelId(routedModel);
+    if (parsed) return { provider: getProviderById(cfg, parsed.providerId), model: parsed.modelId };
+  }
+
+  const providerId = normalizeString(rule?.providerId);
+  const provider = providerId ? getProviderById(cfg, providerId) : pickActiveProvider(cfg);
+  if (routedModel) return { provider, model: routedModel };
+
   const model = normalizeString(provider.defaultModel);
-  if (!model) throw new Error(`Provider(${provider.id}) 缺少 model（routing.models[${endpoint}] 为空且 defaultModel 未配置且请求未指定 model）`);
+  if (!model) throw new Error(`Provider(${provider.id}) 缺少 defaultModel（routing.rules[${endpoint}].model 为空且 defaultModel 未配置）`);
   return { provider, model };
 }
 
@@ -167,6 +188,83 @@ function buildUserText(body: Record<string, any>): string {
   return parts.join("\n\n").trim();
 }
 
+function stripMarkdownFences(text: string): string {
+  const t = normalizeString(text);
+  if (!t) return "";
+  const m = t.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  return normalizeString(m ? m[1] : t);
+}
+
+function parseJsonFromModelTextOrThrow(text: string): any {
+  const raw = stripMarkdownFences(text);
+  if (!raw) throw new Error("模型返回空文本");
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const s = raw.indexOf("{");
+    const e = raw.lastIndexOf("}");
+    if (s >= 0 && e > s) {
+      try {
+        return JSON.parse(raw.slice(s, e + 1));
+      } catch {
+        // fall through
+      }
+    }
+    throw new Error(`模型返回的 JSON 无法解析: ${raw.replace(/\s+/g, " ").slice(0, 200)}`.trim());
+  }
+}
+
+function truncateInlineText(v: unknown, maxLen: number): string {
+  const s = normalizeString(v);
+  if (!s) return "";
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxLen) return oneLine;
+  return oneLine.slice(0, maxLen) + "…";
+}
+
+function formatNextEditEventsForPrompt(v: unknown, { maxFiles = 6, maxEditsPerFile = 6 }: { maxFiles?: number; maxEditsPerFile?: number } = {}): string {
+  const events = Array.isArray(v) ? v : [];
+  const lines: string[] = [];
+  for (const ev of events.slice(0, maxFiles)) {
+    const r = (asRecord(ev) as any) || {};
+    const p = truncateInlineText(r.path, 200) || "(unknown)";
+    const edits = Array.isArray(r.edits) ? r.edits : [];
+    lines.push(`- file: ${p} edits=${edits.length}`);
+    for (const ed of edits.slice(0, maxEditsPerFile)) {
+      const e = (asRecord(ed) as any) || {};
+      const afterStart = Number(e.after_start);
+      const beforeStart = Number(e.before_start);
+      const afterStr = Number.isFinite(afterStart) ? String(afterStart) : "?";
+      const beforeStr = Number.isFinite(beforeStart) ? String(beforeStart) : "?";
+      const beforeText = truncateInlineText(e.before_text, 200);
+      const afterText = truncateInlineText(e.after_text, 200);
+      lines.push(`  - edit: after_start=${afterStr} before_start=${beforeStr} before="${beforeText}" after="${afterText}"`);
+    }
+  }
+  return lines.join("\n").trim();
+}
+
+function normalizeNextEditLocationCandidates(v: unknown, { fallbackPath, maxCount }: { fallbackPath: string; maxCount: number }): any[] {
+  const raw = Array.isArray(v) ? v : [];
+  const out: any[] = [];
+  for (const c of raw) {
+    const r = (asRecord(c) as any) || {};
+    const item = (asRecord(r.item) as any) || {};
+    const range = (asRecord(item.range) as any) || {};
+    const path = normalizeString(item.path) || fallbackPath;
+    const start = Number(range.start);
+    const stop = Number(range.stop);
+    if (!path) continue;
+    if (!Number.isFinite(start) || start < 0) continue;
+    if (!Number.isFinite(stop) || stop <= start) continue;
+    const score = Number(r.score);
+    const debug_info = truncateInlineText(r.debug_info ?? r.debugInfo, 200);
+    out.push({ item: { path, range: { start, stop } }, score: Number.isFinite(score) ? score : 0, debug_info });
+    if (out.length >= maxCount) break;
+  }
+  return out;
+}
+
 function normalizeRequestId(v: unknown): string {
   return typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim();
 }
@@ -191,7 +289,7 @@ function getConversationId(body: Record<string, any>): string {
 function normalizeChatHistoryPairs(history: any[]): Array<{ user: string; assistant: string }> {
   const out: Array<{ user: string; assistant: string }> = [];
   for (const ex of history) {
-    const r = asRecord(ex);
+    const r = (asRecord(ex) as any) || {};
     const user = normalizeString(r.request_message ?? r.requestMessage ?? r.message ?? "");
     const assistant = normalizeString(r.response_text ?? r.responseText ?? r.response ?? r.text ?? "");
     if (!user && !assistant) continue;
@@ -401,11 +499,11 @@ function getContextOrThrow(): any {
   return ctx;
 }
 
-async function getConfigIfEnabled(): Promise<ByokResolvedConfigV1 | null> {
+async function getConfigIfEnabled(): Promise<ByokResolvedConfigV2 | null> {
   const context = getContextOrThrow();
-  const cfg = await loadByokConfigResolved({ context });
-  if (cfg.enabled === false) return null;
-  return cfg as ByokResolvedConfigV1;
+  const raw = await loadByokConfigRaw({ context });
+  if (raw.enabled !== true) return null;
+  return await loadByokConfigResolved({ context });
 }
 
 export async function maybeHandleCallApi({
@@ -428,83 +526,145 @@ export async function maybeHandleCallApi({
   upstreamApiToken?: unknown;
 }): Promise<any | undefined> {
   const ep = normalizeEndpoint(endpoint);
-  const request = asRecord(body);
+  const request = (asRecord(body) as any) || {};
   const requestModel = normalizeString(request.model || request.model_id || request.modelId);
 
   if (ep === "get-models") {
     throwIfAborted(abortSignal);
     const ctx = getContextOrThrow();
+    const raw = await loadByokConfigRaw({ context: ctx });
+    if (raw.enabled !== true) return undefined;
     const cfg = await loadByokConfigResolved({ context: ctx });
-    const tmo = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : cfg.defaults.requestTimeoutMs;
+    throwIfDisabledEndpoint(cfg, ep);
     const baseUrl = normalizeString(cfg.proxy.baseUrl) || normalizeString(upstreamBaseUrl);
     const token = normalizeString(cfg.proxy.token || "") || normalizeString(upstreamApiToken);
-    if (!baseUrl) return undefined;
-    let upstream: any;
-    try {
-      upstream = await fetchAugmentGetModels({ baseUrl, token, timeoutMs: Math.min(tmo, 12_000), abortSignal });
-    } catch (err) {
-      console.warn(`[BYOK] get-models 透传失败：${err instanceof Error ? err.message : String(err)}`);
-      return undefined;
+    let upstream: any = null;
+    if (baseUrl && token) {
+      try {
+        upstream = await fetchAugmentGetModels({ baseUrl, token, timeoutMs: BYOK_MODELS_TIMEOUT_MS, abortSignal });
+      } catch (err) {
+        console.warn(`[BYOK] get-models 透传失败：${err instanceof Error ? err.message : String(err)}`);
+        upstream = null;
+      }
     }
 
     const upstreamFlagsRaw = tryParseJsonObject((upstream as any)?.feature_flags) || {};
     const upstreamFlags = withCamelAliases(upstreamFlagsRaw);
-    const upstreamModelRegistry = tryParseJsonObject((upstreamFlags as any).model_registry ?? (upstreamFlags as any).modelRegistry) || {};
-    const upstreamModelInfoRegistry = tryParseJsonObject((upstreamFlags as any).model_info_registry ?? (upstreamFlags as any).modelInfoRegistry) || {};
-    const upstreamAdditionalChatModels = tryParseJsonObject((upstreamFlags as any).additional_chat_models ?? (upstreamFlags as any).additionalChatModels) || {};
+    if (!cfg.providers.length) throw new Error("未配置任何 Provider");
 
     const byokModelRegistry: Record<string, any> = {};
     const byokModelInfoRegistry: Record<string, any> = {};
-    if (cfg.enabled !== false) {
-      for (const p of cfg.providers) {
-        let models: string[] = [];
-        try {
-          const cached = await getCachedProviderModels({ context: ctx, providerId: p.id, baseUrl: p.baseUrl });
-          models = cached?.models?.length ? cached.models : await listProviderModels(p, Math.min(tmo, 12_000));
-          if (models.length && !cached?.models?.length) await saveCachedProviderModels({ context: ctx, providerId: p.id, baseUrl: p.baseUrl, models });
-        } catch (err) {
-          console.warn(`[BYOK] Provider(${p.id}) models 获取失败：${err instanceof Error ? err.message : String(err)}`);
-        }
-        if (!models.length) {
-          const fallback = normalizeString(p.defaultModel);
-          if (fallback) models = [fallback];
-        }
-        for (const m of models) {
-          const modelId = normalizeString(m);
-          if (!modelId) continue;
-          const byokId = `byok:${p.id}:${modelId}`;
-          const displayName = `${p.id}: ${modelId}`;
-          byokModelRegistry[displayName] = byokId;
-          byokModelInfoRegistry[byokId] = { description: "", disabled: false, displayName, shortName: displayName };
-        }
+    const activeProvider = pickActiveProvider(cfg);
+    for (const p of [activeProvider, ...cfg.providers.filter((x) => x.id !== activeProvider.id)]) {
+      let modelsRaw: string[] = [];
+      try {
+        const cached = await getCachedProviderModels({ context: ctx, providerId: p.id, baseUrl: p.baseUrl });
+        modelsRaw = cached?.models?.length ? cached.models : await listProviderModels(p, BYOK_MODELS_TIMEOUT_MS);
+        if (modelsRaw.length && !cached?.models?.length) await saveCachedProviderModels({ context: ctx, providerId: p.id, baseUrl: p.baseUrl, models: modelsRaw });
+      } catch (err) {
+        console.warn(`[BYOK] Provider(${p.id}) models 获取失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+      const fallback = normalizeString(p.defaultModel);
+      const models = (() => {
+        const out: string[] = [];
+        const seen = new Set<string>();
+        const push = (v: string) => {
+          const m = normalizeString(v);
+          if (!m || seen.has(m)) return;
+          seen.add(m);
+          out.push(m);
+        };
+        if (fallback) push(fallback);
+        for (const m of modelsRaw) push(m);
+        return out;
+      })();
+      if (!models.length) continue;
+      for (const m of models) {
+        const modelId = normalizeString(m);
+        if (!modelId) continue;
+        const byokId = `byok:${p.id}:${modelId}`;
+        const displayName = `${p.id}: ${modelId}`;
+        byokModelRegistry[displayName] = byokId;
+        byokModelInfoRegistry[byokId] = { description: "", disabled: false, displayName, shortName: displayName };
       }
     }
+    if (!Object.keys(byokModelRegistry).length) throw new Error("BYOK models 为空：请检查 Provider models/defaultModel");
 
-    const mergedModelRegistry = { ...upstreamModelRegistry, ...byokModelRegistry };
-    const mergedModelInfoRegistry = { ...upstreamModelInfoRegistry, ...byokModelInfoRegistry };
-    const additionalChatModels = JSON.stringify({ ...upstreamAdditionalChatModels, ...byokModelRegistry });
-    const enableModelRegistry = Object.keys(mergedModelRegistry).length > 0;
+    const defaultChatModelId = normalizeString(activeProvider.defaultModel);
+    if (!defaultChatModelId) throw new Error(`Provider(${activeProvider.id}) 缺少 defaultModel（无法生成 agentChatModel）`);
+    const agentChatModel = `byok:${activeProvider.id}:${defaultChatModelId}`;
+
+    const registryJson = JSON.stringify(byokModelRegistry);
+    const infoRegistryJson = JSON.stringify(byokModelInfoRegistry);
+    const models = Object.entries(byokModelRegistry).map(([, byokId]) => ({
+      name: byokId,
+      suggested_prefix_char_count: 0,
+      suggested_suffix_char_count: 0
+    }));
     const feature_flags = {
       ...upstreamFlags,
-      additional_chat_models: additionalChatModels,
-      additionalChatModels: additionalChatModels,
-      enable_model_registry: enableModelRegistry,
-      enableModelRegistry: enableModelRegistry,
-      enable_grouped_tools: true,
-      enableGroupedTools: true,
-      model_registry: JSON.stringify(mergedModelRegistry),
-      modelRegistry: JSON.stringify(mergedModelRegistry),
-      model_info_registry: JSON.stringify(mergedModelInfoRegistry),
-      modelInfoRegistry: JSON.stringify(mergedModelInfoRegistry)
+      additional_chat_models: registryJson,
+      additionalChatModels: registryJson,
+      agent_chat_model: agentChatModel,
+      agentChatModel: agentChatModel,
+      enable_model_registry: true,
+      enableModelRegistry: true,
+      model_registry: registryJson,
+      modelRegistry: registryJson,
+      model_info_registry: infoRegistryJson,
+      modelInfoRegistry: infoRegistryJson
     };
-    const raw = { ...(upstream && typeof upstream === "object" ? upstream : {}), feature_flags };
-    return transform(raw);
+    const base = upstream && typeof upstream === "object" ? upstream : { default_model: "", feature_flags: {}, languages: [], models: [], user: {}, user_tier: "unknown" };
+    return transform({ ...base, default_model: agentChatModel, models, feature_flags });
   }
   const cfg = await getConfigIfEnabled();
   if (!cfg) return undefined;
-  const tmo = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : cfg.defaults.requestTimeoutMs;
+  throwIfDisabledEndpoint(cfg, ep);
+  if (ep === "next_edit_loc") {
+    const instruction = normalizeString(request.instruction);
+    const path = normalizeString(request.path);
+    const numResultsRaw = Number(request.num_results ?? request.numResults);
+    const numResults = Number.isFinite(numResultsRaw) ? Math.max(1, Math.min(10, Math.floor(numResultsRaw))) : 5;
+    const baseSystem = buildSystemText(request);
+    const baseUser = buildUserText(request);
+    const editEvents = formatNextEditEventsForPrompt(request.edit_events ?? request.editEvents, { maxFiles: 6, maxEditsPerFile: 6 });
+
+    const system = [
+      `你必须只输出 JSON（不允许 Markdown/解释/代码块/额外文本）。`,
+      `输出 schema：{candidate_locations:[{item:{path:string,range:{start:number,stop:number}},score:number,debug_info:string}],unknown_blob_names:[],checkpoint_not_found:false,critical_errors:[]}`,
+      `range.start/range.stop 是 0-based 行号区间，要求 stop > start 且 start >= 0。`,
+      `candidate_locations 数量 <= ${numResults}。`,
+      baseSystem
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+
+    const user = [
+      baseUser,
+      instruction ? `Instruction:\n${instruction}` : "",
+      path ? `Path:\n${path}` : "",
+      `num_results: ${numResults}`,
+      editEvents ? `edit_events:\n${editEvents}` : ""
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+
+    const resolved = resolveProviderAndModel(cfg, ep, requestModel);
+    throwIfAborted(abortSignal);
+    const jsonText = await completeText({ provider: resolved.provider, model: resolved.model, system, user, timeoutMs: BYOK_REQUEST_TIMEOUT_MS, abortSignal });
+    const parsed = parseJsonFromModelTextOrThrow(jsonText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("next_edit_loc: 模型输出不是 JSON 对象");
+    const candidatesRaw = (parsed as any).candidate_locations;
+    const candidates = normalizeNextEditLocationCandidates(candidatesRaw, { fallbackPath: path, maxCount: numResults });
+    if (!candidates.length) throw new Error("next_edit_loc: candidate_locations 为空或格式不合法");
+    return transform({ candidate_locations: candidates, unknown_blob_names: [], checkpoint_not_found: false, critical_errors: [] });
+  }
+
+  if (ep !== "chat" && ep !== "completion" && ep !== "chat-input-completion" && ep !== "edit") throw new Error(`BYOK 未实现的 callApi endpoint: ${ep}`);
+
   const resolved = resolveProviderAndModel(cfg, ep, requestModel);
-  if (!resolved) return undefined;
   throwIfAborted(abortSignal);
   const system = buildSystemText(request);
   const user = buildUserText(request);
@@ -513,39 +673,23 @@ export async function maybeHandleCallApi({
     model: resolved.model,
     system,
     user,
-    temperature: cfg.defaults.temperature,
-    maxTokens: cfg.defaults.maxTokens,
-    timeoutMs: tmo,
+    timeoutMs: BYOK_REQUEST_TIMEOUT_MS,
     abortSignal
   });
 
-  if (ep === "chat" || ep === "completion" || ep === "chat-input-completion" || ep === "edit" || ep === "next_edit_loc") {
-    const raw =
-      ep === "completion" || ep === "chat-input-completion"
-        ? {
-            completion_items: [{ text, suffix_replacement_text: "", skipped_suffix: "" }],
-            unknown_blob_names: [],
-            checkpoint_not_found: false,
-            suggested_prefix_char_count: 0,
-            suggested_suffix_char_count: 0,
-            completion_timeout_ms: 0
-          }
-        : ep === "edit"
-          ? { text, unknown_blob_names: [], checkpoint_not_found: false }
-          : ep === "next_edit_loc"
-            ? {
-                candidate_locations: [
-                  { item: { path: normalizeString(request.path), range: { start: 0, stop: 0 } }, score: 1, debug_info: "byok" }
-                ],
-                unknown_blob_names: [],
-                checkpoint_not_found: false,
-                critical_errors: []
-              }
-            : { text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] };
-    return transform(raw);
+  if (ep === "completion" || ep === "chat-input-completion") {
+    return transform({
+      completion_items: [{ text, suffix_replacement_text: "", skipped_suffix: "" }],
+      unknown_blob_names: [],
+      checkpoint_not_found: false,
+      suggested_prefix_char_count: 0,
+      suggested_suffix_char_count: 0,
+      completion_timeout_ms: 0
+    });
   }
 
-  throw new Error(`BYOK 未实现的 callApi endpoint: ${ep}`);
+  if (ep === "edit") return transform({ text, unknown_blob_names: [], checkpoint_not_found: false });
+  return transform({ text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
 }
 
 export async function maybeHandleCallApiStream({
@@ -566,20 +710,19 @@ export async function maybeHandleCallApiStream({
   const ep = normalizeEndpoint(endpoint);
   const cfg = await getConfigIfEnabled();
   if (!cfg) return undefined;
-  const request = asRecord(body);
+  throwIfDisabledEndpoint(cfg, ep);
+  const request = (asRecord(body) as any) || {};
   const system = buildSystemText(request);
   const user = buildUserText(request);
-  const tmo = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : cfg.defaults.requestTimeoutMs;
+  const tmo = BYOK_REQUEST_TIMEOUT_MS;
   const requestModel = normalizeString(request.model || request.model_id || request.modelId);
   const resolved = resolveProviderAndModel(cfg, ep, requestModel);
-  if (!resolved) return undefined;
   throwIfAborted(abortSignal);
   const resolvedProvider = resolved.provider;
   const resolvedModel = resolved.model;
-  const defaults = cfg.defaults;
 
   if (ep === "next-edit-stream") {
-    const suggested = await completeText({ provider: resolvedProvider, model: resolvedModel, system, user, temperature: defaults.temperature, maxTokens: defaults.maxTokens, timeoutMs: tmo, abortSignal });
+    const suggested = await completeText({ provider: resolvedProvider, model: resolvedModel, system, user, timeoutMs: tmo, abortSignal });
     const raw = {
       next_edit: {
         suggestion_id: `byok-${Date.now()}`,
@@ -605,13 +748,11 @@ export async function maybeHandleCallApiStream({
     return once();
   }
 
-  if (
-    ep === "chat-stream"
-  ) {
+  if (ep === "chat-stream") {
     const toolDefs = getToolDefinitions(request);
     if (!toolDefs.length) {
       async function* gen() {
-        for await (const chunk of streamText({ provider: resolvedProvider, model: resolvedModel, system, user, temperature: defaults.temperature, maxTokens: defaults.maxTokens, timeoutMs: tmo, abortSignal })) {
+        for await (const chunk of streamText({ provider: resolvedProvider, model: resolvedModel, system, user, timeoutMs: tmo, abortSignal })) {
           throwIfAborted(abortSignal);
           yield transform({ text: chunk, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
         }
@@ -654,8 +795,6 @@ export async function maybeHandleCallApiStream({
             model,
             messages,
             tools,
-            temperature: defaults.temperature,
-            maxTokens: defaults.maxTokens,
             timeoutMs: tmo,
             abortSignal
           });
@@ -698,7 +837,7 @@ export async function maybeHandleCallApiStream({
 
       if (provider.type === "anthropic_native") {
         const tools = toAnthropicTools(toolDefs);
-        const maxTokens = typeof defaults.maxTokens === "number" && defaults.maxTokens > 0 ? defaults.maxTokens : 1024;
+        const maxTokens = 1024;
         let messages: any[] = [];
         for (const h of historyPairs) {
           if (h.user) messages.push({ role: "user", content: h.user });
@@ -715,7 +854,6 @@ export async function maybeHandleCallApiStream({
             system: system || undefined,
             messages,
             tools,
-            temperature: defaults.temperature,
             maxTokens,
             timeoutMs: tmo,
             abortSignal
@@ -765,7 +903,7 @@ export async function maybeHandleCallApiStream({
     ep === "generate-conversation-title"
   ) {
     async function* gen() {
-      for await (const chunk of streamText({ provider: resolvedProvider, model: resolvedModel, system, user, temperature: defaults.temperature, maxTokens: defaults.maxTokens, timeoutMs: tmo, abortSignal })) {
+      for await (const chunk of streamText({ provider: resolvedProvider, model: resolvedModel, system, user, timeoutMs: tmo, abortSignal })) {
         throwIfAborted(abortSignal);
         const raw =
           ep === "instruction-stream" || ep === "smart-paste-stream"

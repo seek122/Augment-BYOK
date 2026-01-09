@@ -1,5 +1,5 @@
 import { parseSse } from "../common/sse";
-import { buildAbortSignal, joinBaseUrl, normalizeString, safeFetch } from "../common/http";
+import { buildAbortSignal, joinBaseUrl, normalizeRawToken, safeFetch } from "../common/http";
 
 export type AnthropicMessage = { role: "user" | "assistant"; content: string };
 export type AnthropicTool = { name: string; description?: string; input_schema: any };
@@ -31,7 +31,7 @@ export async function anthropicComplete({
 }): Promise<string> {
   const url = joinBaseUrl(baseUrl, "v1/messages");
   if (!url) throw new Error("Anthropic baseUrl 无效");
-  const key = normalizeString(apiKey);
+  const key = normalizeRawToken(apiKey);
   if (!key) throw new Error("Anthropic apiKey 未配置");
 
   const body: any = { model, max_tokens: maxTokens, messages, stream: false };
@@ -45,10 +45,10 @@ export async function anthropicComplete({
       headers: {
         "content-type": "application/json",
         "x-api-key": key,
-      "anthropic-version": "2023-06-01"
-    },
-    body: JSON.stringify(body),
-    signal: buildAbortSignal(timeoutMs, abortSignal)
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify(body),
+      signal: buildAbortSignal(timeoutMs, abortSignal)
     },
     "Anthropic"
   );
@@ -87,7 +87,7 @@ export async function anthropicCompleteWithTools({
 }): Promise<AnthropicCompleteWithToolsResult> {
   const url = joinBaseUrl(baseUrl, "v1/messages");
   if (!url) throw new Error("Anthropic baseUrl 无效");
-  const key = normalizeString(apiKey);
+  const key = normalizeRawToken(apiKey);
   if (!key) throw new Error("Anthropic apiKey 未配置");
 
   const body: any = { model, max_tokens: maxTokens, messages, tools, stream: false };
@@ -101,10 +101,10 @@ export async function anthropicCompleteWithTools({
       headers: {
         "content-type": "application/json",
         "x-api-key": key,
-      "anthropic-version": "2023-06-01"
-    },
-    body: JSON.stringify(body),
-    signal: buildAbortSignal(timeoutMs, abortSignal)
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify(body),
+      signal: buildAbortSignal(timeoutMs, abortSignal)
     },
     "Anthropic"
   );
@@ -145,7 +145,7 @@ export async function* anthropicStream({
 }): AsyncGenerator<string> {
   const url = joinBaseUrl(baseUrl, "v1/messages");
   if (!url) throw new Error("Anthropic baseUrl 无效");
-  const key = normalizeString(apiKey);
+  const key = normalizeRawToken(apiKey);
   if (!key) throw new Error("Anthropic apiKey 未配置");
 
   const body: any = { model, max_tokens: maxTokens, messages, stream: true };
@@ -159,10 +159,10 @@ export async function* anthropicStream({
       headers: {
         "content-type": "application/json",
         "x-api-key": key,
-      "anthropic-version": "2023-06-01"
-    },
-    body: JSON.stringify(body),
-    signal: buildAbortSignal(timeoutMs, abortSignal)
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify(body),
+      signal: buildAbortSignal(timeoutMs, abortSignal)
     },
     "Anthropic"
   );
@@ -200,7 +200,7 @@ export async function anthropicListModels({
 }): Promise<string[]> {
   const url = joinBaseUrl(baseUrl, "v1/models");
   if (!url) throw new Error("Anthropic baseUrl 无效");
-  const key = normalizeString(apiKey);
+  const key = normalizeRawToken(apiKey);
   if (!key) throw new Error("Anthropic apiKey 未配置");
 
   const resp = await safeFetch(

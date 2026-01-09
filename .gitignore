@@ -3,6 +3,7 @@ dist/
 .cache/
 tmp/
 node_modules/
+.pnpm-store/
 
 .vscode/
 .ace-tool/
@@ -10,3 +11,5 @@ node_modules/
 # 本地指令/规格（不纳入 git）
 AGENTS.md
 /openspec/
+
+.env

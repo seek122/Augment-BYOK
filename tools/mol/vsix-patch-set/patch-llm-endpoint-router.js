@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { ensureMarker } = require("../../atom/common/patch");
 
 const MARKER = "__augment_byok_llm_endpoint_router_patched";
 
@@ -15,6 +16,26 @@ function normalizeEndpoint(ep) {
   return s.replace(/^\/+/, "");
 }
 
+function findMatchIndexes(src, re, label) {
+  const matches = Array.from(src.matchAll(re));
+  if (matches.length === 0) throw new Error(`${label} needle not found (upstream may have changed): matched=0`);
+  const indexes = matches.map((m) => m.index).filter((i) => typeof i === "number" && i >= 0);
+  if (indexes.length !== matches.length) throw new Error(`${label} needle match missing index`);
+  return indexes.sort((a, b) => a - b);
+}
+
+function injectIntoAsyncMethods(src, methodName, injection) {
+  const indexes = findMatchIndexes(src, new RegExp(`async\\s+${methodName}\\s*\\(`, "g"), methodName);
+  let out = src;
+  for (let i = indexes.length - 1; i >= 0; i--) {
+    const idx = indexes[i];
+    const openBrace = out.indexOf("{", idx);
+    if (openBrace < 0) throw new Error(`${methodName} patch: failed to locate method body opening brace`);
+    out = out.slice(0, openBrace + 1) + injection + out.slice(openBrace + 1);
+  }
+  return { out, count: indexes.length };
+}
+
 function patchLlmEndpointRouter(filePath, { llmEndpoints }) {
   if (!fs.existsSync(filePath)) throw new Error(`missing file: ${filePath}`);
   const original = fs.readFileSync(filePath, "utf8");
@@ -25,26 +46,25 @@ function patchLlmEndpointRouter(filePath, { llmEndpoints }) {
 
   const endpointsLiteral = JSON.stringify(endpoints);
 
-  const injectStreamNeedle = "async callApiStream(t,r,n,i,o=d=>d,s,a,c,l,u=!1){";
-  const injectApiNeedle = "async callApi(t,r,n,i,o=p=>p,s,a,c,l,u=!1,d,f){";
-
-  if (!original.includes(injectStreamNeedle)) throw new Error(`callApiStream needle not found (upstream changed?): ${injectStreamNeedle}`);
-  if (!original.includes(injectApiNeedle)) throw new Error(`callApi needle not found (upstream changed?): ${injectApiNeedle}`);
-
   const streamInjection =
-    `${injectStreamNeedle}` +
-    `const __byok_ep=typeof n==\"string\"?n.replace(/^\\/+/,\"\"):\"\";const __byok_set=(globalThis.__augment_byok_llm_endpoints_set??=new Set(${endpointsLiteral}));if(__byok_set.has(__byok_ep)){const __byok_res=await require(\"./byok/coord/byok-routing/llm-router\").maybeHandleCallApiStream({requestId:t,endpoint:__byok_ep,body:i,transform:o,timeoutMs:a,abortSignal:l,upstreamBaseUrl:s,upstreamApiToken:r.apiToken});if(__byok_res!==void 0)return __byok_res;}`;
+    `const __byok_cfg=arguments[1]||{};const __byok_ep=typeof arguments[2]==\"string\"?arguments[2].replace(/^\\/+/,\"\"):\"\";` +
+    `const __byok_set=(globalThis.__augment_byok_llm_endpoints_set??=new Set(${endpointsLiteral}));` +
+    `if(__byok_set.has(__byok_ep)){const __byok_res=await require(\"./byok/coord/byok-routing/llm-router\").maybeHandleCallApiStream({requestId:arguments[0],endpoint:__byok_ep,body:arguments[3],transform:arguments[4],timeoutMs:arguments[6],abortSignal:arguments[8],upstreamBaseUrl:arguments[5],upstreamApiToken:__byok_cfg.apiToken});if(__byok_res!==void 0)return __byok_res;}`;
 
   const apiInjection =
-    `${injectApiNeedle}` +
-    `const __byok_ep=typeof n==\"string\"?n.replace(/^\\/+/,\"\"):\"\";const __byok_set=(globalThis.__augment_byok_llm_endpoints_set??=new Set(${endpointsLiteral}));if(__byok_set.has(__byok_ep)){const __byok_res=await require(\"./byok/coord/byok-routing/llm-router\").maybeHandleCallApi({requestId:t,endpoint:__byok_ep,body:i,transform:o,timeoutMs:a,abortSignal:l,upstreamBaseUrl:s,upstreamApiToken:(d??r.apiToken)});if(__byok_res!==void 0)return __byok_res;}`;
+    `const __byok_cfg=arguments[1]||{};const __byok_ep=typeof arguments[2]==\"string\"?arguments[2].replace(/^\\/+/,\"\"):\"\";` +
+    `const __byok_set=(globalThis.__augment_byok_llm_endpoints_set??=new Set(${endpointsLiteral}));` +
+    `if(__byok_set.has(__byok_ep)){const __byok_res=await require(\"./byok/coord/byok-routing/llm-router\").maybeHandleCallApi({requestId:arguments[0],endpoint:__byok_ep,body:arguments[3],transform:arguments[4],timeoutMs:arguments[6],abortSignal:arguments[8],upstreamBaseUrl:arguments[5],upstreamApiToken:(arguments[10]??__byok_cfg.apiToken)});if(__byok_res!==void 0)return __byok_res;}`;
 
-  let next = original.split(injectStreamNeedle).join(streamInjection);
-  next = next.split(injectApiNeedle).join(apiInjection);
+  let next = original;
+  const streamRes = injectIntoAsyncMethods(next, "callApiStream", streamInjection);
+  next = streamRes.out;
+  const apiRes = injectIntoAsyncMethods(next, "callApi", apiInjection);
+  next = apiRes.out;
 
-  next = next + `\n;/*${MARKER}*/\n`;
+  next = ensureMarker(next, MARKER);
   fs.writeFileSync(filePath, next, "utf8");
-  return { changed: true, reason: "patched", endpoints: endpoints.length };
+  return { changed: true, reason: "patched", endpoints: endpoints.length, callApiStreamPatched: streamRes.count, callApiPatched: apiRes.count };
 }
 
 module.exports = { patchLlmEndpointRouter };

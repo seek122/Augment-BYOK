@@ -26,13 +26,14 @@
   const rpc = (method, params) => {
     const requestId = String(Date.now()) + ":" + Math.random().toString(16).slice(2);
     vscode.postMessage({ type: "byok-rpc", requestId, method, params: params || null });
+    const timeoutMs = method === "listModels" ? 20000 : method === "testProxy" ? 12000 : 10000;
     return new Promise((resolve, reject) => {
       pending.set(requestId, { resolve, reject });
       setTimeout(() => {
         if (!pending.has(requestId)) return;
         pending.delete(requestId);
         reject(new Error("请求超时"));
-      }, 10000);
+      }, timeoutMs);
     });
   };
 
@@ -47,24 +48,15 @@
   const readFormToConfig = () => {
     const cfg = JSON.parse(
       JSON.stringify(
-        state.config || { version: 1, enabled: true, proxy: { baseUrl: "" }, providers: [], routing: { activeProviderId: "", routes: {} }, defaults: {} }
+        state.config || { version: 2, enabled: false, proxy: { baseUrl: "" }, providers: [], routing: { activeProviderId: "", rules: {} } }
       )
     );
+    cfg.version = 2;
     cfg.enabled = Boolean(el("check-plugin-enabled")?.checked);
     cfg.proxy = cfg.proxy || { baseUrl: "" };
     cfg.proxy.baseUrl = normalizeString(el("input-augment-base-url")?.value);
-    cfg.routing = cfg.routing || { activeProviderId: "", routes: {} };
+    cfg.routing = cfg.routing || { activeProviderId: "", rules: {} };
     cfg.routing.activeProviderId = normalizeString(el("select-active-provider")?.value);
-    cfg.defaults = cfg.defaults || {};
-
-    const t = Number(el("input-default-temp")?.value || "");
-    const m = Number(el("input-default-max")?.value || "");
-
-    if (Number.isFinite(t)) cfg.defaults.temperature = t;
-    else delete cfg.defaults.temperature;
-    if (Number.isFinite(m) && m > 0) cfg.defaults.maxTokens = m;
-    else delete cfg.defaults.maxTokens;
-
     return cfg;
   };
 
@@ -122,7 +114,14 @@
       chevron.className = "icon-chevron";
       chevron.textContent = "▶";
       const title = document.createElement("span");
-      title.innerHTML = "<strong>" + pid + "</strong> <span class='text-muted text-xs'>(" + kind + ")</span>";
+      const strong = document.createElement("strong");
+      strong.textContent = pid;
+      const meta = document.createElement("span");
+      meta.className = "text-muted text-xs";
+      meta.textContent = `(${kind})`;
+      title.appendChild(strong);
+      title.appendChild(document.createTextNode(" "));
+      title.appendChild(meta);
       left.appendChild(chevron);
       left.appendChild(title);
 
@@ -210,7 +209,7 @@
       g2.appendChild(textModelsStatus);
       const textModelHint = document.createElement("div");
       textModelHint.className = "text-muted text-xs";
-      textModelHint.textContent = "提示：主面板 Model Picker 优先；此处 defaultModel 仅作为 fallback。";
+      textModelHint.textContent = "提示：chat/chat-stream 由主面板 Model Picker 专属控制；其它 endpoint 未指定 model 时才会用 defaultModel 兜底。";
       g2.appendChild(textModelHint);
 
       const g3 = document.createElement("div");
@@ -230,7 +229,7 @@
           textModelsStatus.textContent = "models: 加载中...";
           const baseUrl = normalizeString(inputBase.value) || undefined;
           const apiKey = normalizeString(inputKey.value) || undefined;
-          const r = await rpc("listModels", { providerId: pid, baseUrl, apiKey });
+          const r = await rpc("listModels", { providerId: pid, providerType: kind, baseUrl, apiKey });
           const models = Array.isArray(r?.models) ? r.models.map((x) => normalizeString(x)).filter(Boolean) : [];
           const current = normalizeString(p.defaultModel);
           state.modelsCacheByProviderId[pid] = { updatedAtMs: Date.now(), models };
@@ -268,11 +267,49 @@
 
     const providers = Array.isArray(state.config?.providers) ? state.config.providers : [];
     const providerIds = providers.map((p) => normalizeString(p.id)).filter(Boolean);
-    state.config.routing = state.config.routing && typeof state.config.routing === "object" ? state.config.routing : { activeProviderId: "", routes: {} };
-    state.config.routing.routes = state.config.routing.routes && typeof state.config.routing.routes === "object" ? state.config.routing.routes : {};
-    state.config.routing.models = state.config.routing.models && typeof state.config.routing.models === "object" ? state.config.routing.models : {};
-    const routes = state.config.routing.routes;
-    const routeModels = state.config.routing.models;
+    state.config.routing = state.config.routing && typeof state.config.routing === "object" ? state.config.routing : { activeProviderId: "", rules: {} };
+    state.config.routing.rules = state.config.routing.rules && typeof state.config.routing.rules === "object" ? state.config.routing.rules : {};
+    const rules = state.config.routing.rules;
+
+    const isChatEndpoint = (ep) => ep === "chat" || ep === "chat-stream";
+    const parseByokModelId = (model) => {
+      const raw = normalizeString(model);
+      if (!raw.startsWith("byok:")) return null;
+      const rest = raw.slice("byok:".length);
+      const idx = rest.indexOf(":");
+      if (idx <= 0 || idx >= rest.length - 1) return null;
+      const providerId = rest.slice(0, idx);
+      const modelId = rest.slice(idx + 1);
+      if (!providerId || !modelId) return null;
+      return { providerId, modelId };
+    };
+
+    const readRule = (ep) => {
+      const r = rules[ep] && typeof rules[ep] === "object" ? rules[ep] : {};
+      if (isChatEndpoint(ep)) {
+        return r && r.enabled === false ? { enabled: false } : {};
+      }
+      const out = { ...r };
+      const parsed = parseByokModelId(out.model);
+      if (parsed) {
+        out.providerId = normalizeString(out.providerId) || parsed.providerId;
+        out.model = parsed.modelId;
+      }
+      return out;
+    };
+
+    const writeRule = (ep, next) => {
+      const out = {};
+      if (next && next.enabled === false) out.enabled = false;
+      const providerId = normalizeString(next && next.providerId);
+      const model = normalizeString(next && next.model);
+      if (!isChatEndpoint(ep)) {
+        if (providerId) out.providerId = providerId;
+        if (model) out.model = model;
+      }
+      if (Object.keys(out).length) rules[ep] = out;
+      else delete rules[ep];
+    };
 
     selectActive.innerHTML = "";
     selectActive.appendChild(new Option("（自动：第一个 Provider）", ""));
@@ -307,6 +344,27 @@
     }
 
     for (const ep of endpoints) {
+      const r = rules[ep] && typeof rules[ep] === "object" ? rules[ep] : null;
+      if (!r) continue;
+      if (isChatEndpoint(ep)) {
+        if (r.enabled === false) rules[ep] = { enabled: false };
+        else delete rules[ep];
+        continue;
+      }
+      const parsed = parseByokModelId(r.model);
+      const providerId = normalizeString(r.providerId) || (parsed ? parsed.providerId : "");
+      const model = parsed ? parsed.modelId : normalizeString(r.model);
+      const next = {};
+      if (r.enabled === false) next.enabled = false;
+      if (providerId) next.providerId = providerId;
+      if (model) next.model = model;
+      if (Object.keys(next).length) rules[ep] = next;
+      else delete rules[ep];
+    }
+
+    for (const ep of endpoints) {
+      const isChat = isChatEndpoint(ep);
+      let rule = readRule(ep);
       const tr = document.createElement("tr");
 
       const tdEp = document.createElement("td");
@@ -316,22 +374,42 @@
       tdEp.appendChild(epText);
 
       const tdMode = document.createElement("td");
+      const modeWrap = document.createElement("div");
+      modeWrap.className = "flex-row";
+
+      const chkEnabled = document.createElement("input");
+      chkEnabled.type = "checkbox";
+      chkEnabled.title = "取消勾选将彻底禁用该 endpoint（fail-fast，不回落到上游）";
+      chkEnabled.checked = rule.enabled !== false;
+
       const modeBadge = document.createElement("span");
       modeBadge.className = "status-badge text-xs";
       const updateMode = () => {
-        const vp = normalizeString(routes[ep]);
-        const vm = normalizeString(routeModels[ep]);
+        const enabled = rule.enabled !== false;
+        if (!enabled) return setBadge(modeBadge, { text: "禁用", level: "error" });
+        if (isChat) return setBadge(modeBadge, { text: "Model Picker", level: "success" });
+        const vp = normalizeString(rule.providerId);
+        const vm = normalizeString(rule.model);
         const text = vp && vm ? "覆盖 P+M" : vp ? "覆盖 P" : vm ? "覆盖 M" : "默认";
         setBadge(modeBadge, { text, level: vp || vm ? "success" : "warning" });
       };
       updateMode();
-      tdMode.appendChild(modeBadge);
+      modeWrap.appendChild(chkEnabled);
+      modeWrap.appendChild(modeBadge);
+      tdMode.appendChild(modeWrap);
 
       const tdProvider = document.createElement("td");
       const selProvider = document.createElement("select");
-      selProvider.appendChild(new Option("（默认：activeProviderId）", ""));
-      for (const id of providerIds) selProvider.appendChild(new Option(id, id));
-      selProvider.value = normalizeString(routes[ep]);
+      if (isChat) {
+        selProvider.appendChild(new Option("（Model Picker 专属）", ""));
+        selProvider.disabled = true;
+      } else {
+        selProvider.appendChild(new Option("（默认：activeProviderId）", ""));
+        for (const id of providerIds) selProvider.appendChild(new Option(id, id));
+        const currentProviderId = normalizeString(rule.providerId);
+        if (currentProviderId && !providerIds.includes(currentProviderId)) selProvider.appendChild(new Option(`${currentProviderId}（未知）`, currentProviderId));
+        selProvider.value = currentProviderId;
+      }
       tdProvider.appendChild(selProvider);
 
       const tdModel = document.createElement("td");
@@ -344,9 +422,15 @@
         const cached = Array.isArray(state.modelsCacheByProviderId?.[providerId]?.models)
           ? state.modelsCacheByProviderId[providerId].models.map((x) => normalizeString(x)).filter(Boolean)
           : [];
-        const current = normalizeString(routeModels[ep]);
         selModel.innerHTML = "";
-        selModel.appendChild(new Option("（默认：主面板 Model Picker / defaultModel）", ""));
+        if (isChat) {
+          selModel.appendChild(new Option("（Model Picker 专属）", ""));
+          selModel.disabled = true;
+          return;
+        }
+        const current = normalizeString(rule.model);
+        selModel.disabled = rule.enabled === false;
+        selModel.appendChild(new Option("（默认：provider.defaultModel）", ""));
         if (current && !cached.includes(current)) selModel.appendChild(new Option(current + "（当前/不在缓存）", current));
         for (const m of cached) selModel.appendChild(new Option(m, m));
         selModel.value = current;
@@ -362,7 +446,7 @@
         const provider = providers.find((x) => normalizeString(x.id) === providerId) || null;
         try {
           btnRefreshModels.disabled = true;
-          const r = await rpc("listModels", { providerId, baseUrl: normalizeString(provider?.baseUrl) || undefined });
+          const r = await rpc("listModels", { providerId, providerType: normalizeString(provider?.type) || undefined, baseUrl: normalizeString(provider?.baseUrl) || undefined });
           const models = Array.isArray(r?.models) ? r.models.map((x) => normalizeString(x)).filter(Boolean) : [];
           state.modelsCacheByProviderId[providerId] = { updatedAtMs: Date.now(), models };
           updateModelOptions();
@@ -373,23 +457,43 @@
           btnRefreshModels.disabled = false;
         }
       });
+      btnRefreshModels.disabled = isChat || rule.enabled === false;
 
       modelRow.appendChild(selModel);
       modelRow.appendChild(btnRefreshModels);
       tdModel.appendChild(modelRow);
 
+      chkEnabled.addEventListener("change", () => {
+        rule = { ...rule };
+        if (chkEnabled.checked) delete rule.enabled;
+        else rule.enabled = false;
+        writeRule(ep, rule);
+        renderRouting();
+      });
+
       selProvider.addEventListener("change", () => {
         const v = normalizeString(selProvider.value);
-        if (v) routes[ep] = v;
-        else delete routes[ep];
+        rule = { ...rule };
+        if (v) rule.providerId = v;
+        else delete rule.providerId;
+        writeRule(ep, rule);
         updateModelOptions();
         updateMode();
       });
 
       selModel.addEventListener("change", () => {
         const v = normalizeString(selModel.value);
-        if (v) routeModels[ep] = v;
-        else delete routeModels[ep];
+        rule = { ...rule };
+        if (v) rule.model = v;
+        else delete rule.model;
+        if (v && !normalizeString(rule.providerId)) {
+          const implied = normalizeString(selectActive.value) || providerIds[0];
+          if (implied) {
+            rule.providerId = implied;
+            selProvider.value = implied;
+          }
+        }
+        writeRule(ep, rule);
         updateMode();
       });
 
@@ -405,8 +509,6 @@
     if (!state.config) return;
     el("check-plugin-enabled").checked = Boolean(state.config.enabled);
     el("input-augment-base-url").value = normalizeString(state.config.proxy && state.config.proxy.baseUrl);
-    el("input-default-temp").value = state.config.defaults && typeof state.config.defaults.temperature === "number" ? String(state.config.defaults.temperature) : "";
-    el("input-default-max").value = state.config.defaults && typeof state.config.defaults.maxTokens === "number" ? String(state.config.defaults.maxTokens) : "";
     renderEffectiveUrl();
     renderProviderCards();
     renderRouting();

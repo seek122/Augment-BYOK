@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { ensureMarker } = require("../../atom/common/patch");
 
 const MARKER = "__augment_byok_settings_secrets_webview_patched";
 
@@ -17,13 +18,6 @@ function listSettingsAssets(assetsDir) {
   } catch {
     return [];
   }
-}
-
-function ensureMarker(src) {
-  if (src.includes(MARKER)) return src;
-  const sm = src.lastIndexOf("//# sourceMappingURL=");
-  if (sm >= 0) return src.slice(0, sm) + `;/*${MARKER}*/\n` + src.slice(sm);
-  return src + `\n;/*${MARKER}*/\n`;
 }
 
 function patchFile(filePath, { checkOnly }) {
@@ -52,7 +46,7 @@ function patchFile(filePath, { checkOnly }) {
     return { filePath, changed: false, patched: true, reason: "check_only_ok" };
   }
 
-  const out = ensureMarker(next);
+  const out = ensureMarker(next, MARKER);
   fs.writeFileSync(filePath, out, "utf8");
   if (!out.includes(MARKER) || !patched) throw new Error(`Settings Secrets patch failed for ${path.basename(filePath)}`);
   return { filePath, changed: true, patched: true, reason: "patched" };
@@ -82,4 +76,3 @@ if (require.main === module) {
   }
   patchSettingsSecretsWebview({ extensionDir, checkOnly });
 }
-

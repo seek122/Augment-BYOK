@@ -1,33 +1,26 @@
 #!/usr/bin/env node
 "use strict";
 
-const fs = require("fs");
 const path = require("path");
 const { buildBearerAuth } = require("../../atom/common/auth");
+const { writeJson, writeText } = require("../../atom/common/fs");
+const { normalizeBaseUrl } = require("../../atom/common/url");
 
 function parseArgs(argv) {
-  const out = { baseUrl: "", token: "", outJson: "", outMd: "", timeoutMs: 20000 };
+  const out = { baseUrl: "", token: "", tokenEnv: "", outJson: "", outMd: "", timeoutMs: 20000 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--base-url") out.baseUrl = argv[++i] || "";
     else if (a === "--token") out.token = argv[++i] || "";
+    else if (a === "--token-env") out.tokenEnv = argv[++i] || "";
     else if (a === "--out-json") out.outJson = argv[++i] || "";
     else if (a === "--out-md") out.outMd = argv[++i] || "";
-    else if (a === "--timeout-ms") out.timeoutMs = Number(argv[++i] || out.timeoutMs);
+    else if (a === "--timeout-ms") {
+      const v = Number(argv[++i]);
+      if (Number.isFinite(v) && v > 0) out.timeoutMs = v;
+    }
   }
   return out;
-}
-
-function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function normalizeBaseUrl(raw) {
-  const s = typeof raw === "string" ? raw.trim() : "";
-  if (!s) return "";
-  if (!/^https?:\/\//i.test(s)) return "";
-  if (!s.endsWith("/")) return "";
-  return s;
 }
 
 async function fetchJson({ url, auth, timeoutMs }) {
@@ -73,10 +66,11 @@ async function main() {
   const repoRoot = path.resolve(__dirname, "../../..");
   const args = parseArgs(process.argv.slice(2));
   const baseUrl = normalizeBaseUrl(args.baseUrl);
-  if (!baseUrl) throw new Error("invalid --base-url (must be service base url, ends with /)");
+  if (!baseUrl) throw new Error("invalid --base-url（必须是 http(s) 服务基地址；尾随 / 会自动补齐）");
 
-  const auth = buildBearerAuth(args.token);
-  if (!auth) throw new Error("missing --token");
+  const token = args.token || (args.tokenEnv ? process.env[String(args.tokenEnv || "").trim()] || "" : "");
+  const auth = buildBearerAuth(token);
+  if (!auth) throw new Error(args.tokenEnv ? `missing token (env ${String(args.tokenEnv || "").trim()})` : "missing --token");
 
   const url = `${baseUrl}get-models`;
   const r = await fetchJson({ url, auth, timeoutMs: args.timeoutMs });
@@ -97,9 +91,7 @@ async function main() {
 
   const outJson = args.outJson ? path.resolve(repoRoot, args.outJson) : path.join(repoRoot, ".cache", "reports", "get-models.report.json");
   const outMd = args.outMd ? path.resolve(repoRoot, args.outMd) : path.join(repoRoot, ".cache", "reports", "get-models.report.md");
-  ensureDir(path.dirname(outJson));
-
-  fs.writeFileSync(outJson, JSON.stringify(report, null, 2) + "\n", "utf8");
+  writeJson(outJson, report);
 
   const md = [
     `# Get Models Report`,
@@ -111,14 +103,14 @@ async function main() {
     `- default_model: ${report.getModels.default_model || "(empty)"}`,
     ``,
     `## Highlights`,
-    ...Object.keys(flagsSummary.highlights).length === 0 ? ["(none)"] : Object.entries(flagsSummary.highlights).map(([k, v]) => `- ${k}: ${JSON.stringify(v)}`),
+    ...(Object.keys(flagsSummary.highlights).length === 0 ? ["(none)"] : Object.entries(flagsSummary.highlights).map(([k, v]) => `- ${k}: ${JSON.stringify(v)}`)),
     ``,
     `## Notes`,
     `- 请求使用 POST ${baseUrl}get-models（与上游 callApi 方式一致）。`,
     `- Base URL 视为服务基地址：不自动补/抽 /api。`
   ].join("\n");
 
-  fs.writeFileSync(outMd, md + "\n", "utf8");
+  writeText(outMd, md + "\n");
 
   console.log(`[get-models] ${r.status} ${url}`);
   console.log(`[get-models] feature_flags keys: ${flagsSummary.count}`);

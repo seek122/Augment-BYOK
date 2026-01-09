@@ -4,45 +4,23 @@
 const fs = require("fs");
 const path = require("path");
 const { buildBearerAuth } = require("../../atom/common/auth");
+const { readJson } = require("../../atom/common/fs");
+const { buildUrl, normalizeBaseUrl, normalizePath } = require("../../atom/common/url");
 
 function parseArgs(argv) {
-  const out = { profile: "", baseUrl: "", token: "", timeoutMs: 4000 };
+  const out = { profile: "", baseUrl: "", token: "", tokenEnv: "", timeoutMs: 4000 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--profile") out.profile = argv[++i] || "";
     else if (a === "--base-url") out.baseUrl = argv[++i] || "";
     else if (a === "--token") out.token = argv[++i] || "";
-    else if (a === "--timeout-ms") out.timeoutMs = Number(argv[++i] || out.timeoutMs);
+    else if (a === "--token-env") out.tokenEnv = argv[++i] || "";
+    else if (a === "--timeout-ms") {
+      const v = Number(argv[++i]);
+      if (Number.isFinite(v) && v > 0) out.timeoutMs = v;
+    }
   }
   return out;
-}
-
-function readJson(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
-
-function normalizeBaseUrl(raw) {
-  const s = typeof raw === "string" ? raw.trim() : "";
-  if (!s) return "";
-  if (!/^https?:\/\//i.test(s)) return "";
-  if (!s.endsWith("/")) return "";
-  if (/\/api\/$/i.test(s)) return "";
-  return s;
-}
-
-function normalizePath(p) {
-  const s = typeof p === "string" ? p.trim() : "";
-  if (!s) return "";
-  const withSlash = s.startsWith("/") ? s : `/${s}`;
-  const clean = withSlash.replace(/\/+$/, "");
-  if (!clean || clean === "/") return "";
-  return clean;
-}
-
-function buildUrl(baseUrl, endpointPath) {
-  const base = normalizeBaseUrl(baseUrl);
-  const ep = normalizePath(endpointPath).replace(/^\/+/, "");
-  return base && ep ? `${base}${ep}` : "";
 }
 
 async function postJson({ url, auth, timeoutMs }) {
@@ -75,17 +53,21 @@ async function postSse({ url, auth, timeoutMs }) {
     try {
       await resp.body?.cancel?.();
     } catch {
-      // ignore
     }
     return { status: resp.status, body: "", resp };
   } finally {
     clearTimeout(timer);
-    try {
-      ac.abort();
-    } catch {
-      // ignore
-    }
   }
+}
+
+function classifyStatus(status) {
+  if (status === 401 || status === 403) return { ok: false, level: "FAIL", reason: "unauthorized" };
+  if (status === 404) return { ok: false, level: "FAIL", reason: "not_found" };
+  if (status === 429) return { ok: false, level: "FAIL", reason: "rate_limited" };
+  if (status >= 500) return { ok: false, level: "FAIL", reason: "server_error" };
+  if (status >= 200 && status < 400) return { ok: true, level: "PASS", reason: "ok" };
+  if (status >= 400 && status < 500) return { ok: true, level: "WARN", reason: "client_error" };
+  return { ok: false, level: "FAIL", reason: "unknown_status" };
 }
 
 async function main() {
@@ -96,10 +78,11 @@ async function main() {
 
   const profile = readJson(profilePath);
   const baseUrl = normalizeBaseUrl(args.baseUrl || profile?.baseUrlDefault || "");
-  if (!baseUrl) throw new Error("invalid --base-url (must be service base url, ends with /, without /api/)");
+  if (!baseUrl) throw new Error("invalid --base-url（必须是 http(s) 服务基地址；不猜测/补全 /api，尾随 / 会自动补齐）");
 
-  const auth = buildBearerAuth(args.token);
-  if (!auth) throw new Error("missing --token");
+  const token = args.token || (args.tokenEnv ? process.env[String(args.tokenEnv || "").trim()] || "" : "");
+  const auth = buildBearerAuth(token);
+  if (!auth) throw new Error(args.tokenEnv ? `missing token (env ${String(args.tokenEnv || "").trim()})` : "missing --token");
 
   const allowed = Array.isArray(profile?.allowedPaths) ? profile.allowedPaths : [];
   const sse = Array.isArray(profile?.ssePaths) ? profile.ssePaths : [];
@@ -114,19 +97,25 @@ async function main() {
     if (!url) throw new Error(`failed to build url for ${p}`);
     const timeoutMs = p === "/prompt-enhancer" ? Math.max(args.timeoutMs, 12000) : args.timeoutMs;
     const r = sseSet.has(p) ? await postSse({ url, auth, timeoutMs }) : await postJson({ url, auth, timeoutMs });
-    const ok = r.status !== 404 && r.status !== 401;
-    results.push({ path: p, status: r.status, ok, body: r.body });
-    console.log(`[relay] ${ok ? "OK" : "FAIL"} ${r.status} ${p}`);
+    const cls = classifyStatus(r.status);
+    results.push({ path: p, status: r.status, ok: cls.ok, level: cls.level, reason: cls.reason, body: r.body });
+    console.log(`[relay] ${cls.level} ${r.status} ${p}`);
   }
 
-  const failed = results.filter((r) => !r.ok);
+  const failed = results.filter((r) => r.level === "FAIL");
+  const warned = results.filter((r) => r.level === "WARN");
   if (failed.length > 0) {
-    console.log(`[relay] FAILED: ${failed.length}/${results.length} endpoints returned 404`);
-    for (const f of failed) console.log(`- ${f.path}: ${f.status} ${f.body ? `(${f.body})` : ""}`.trim());
+    console.log(`[relay] FAIL: ${failed.length}/${results.length}`);
+    for (const f of failed) console.log(`- ${f.path}: ${f.status} ${f.reason} ${f.body ? `(${f.body})` : ""}`.trim());
     process.exit(1);
   }
 
-  console.log(`[relay] PASS: ${results.length}/${results.length}`);
+  if (warned.length > 0) {
+    console.log(`[relay] WARN: ${warned.length}/${results.length} endpoints returned 4xx (but not 401/403/404/429)`);
+    for (const w of warned) console.log(`- ${w.path}: ${w.status} ${w.body ? `(${w.body})` : ""}`.trim());
+  }
+
+  console.log(`[relay] PASS: ${results.length}/${results.length}${warned.length > 0 ? ` (warnings=${warned.length})` : ""}`);
 }
 
 main().catch((err) => {

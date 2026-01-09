@@ -1,12 +1,9 @@
 import { AUGMENT_BYOK } from "../../constants";
 import { ensureTrailingSlash, normalizeString } from "../../atom/common/http";
+import { asRecord } from "../../atom/common/object";
 
 type ProviderModelsCacheEntry = { baseUrl: string; updatedAtMs: number; models: string[] };
-type ProviderModelsCacheV1 = { version: 1; providers: Record<string, ProviderModelsCacheEntry> };
-
-function asRecord(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
-}
+type ProviderModelsCacheV2 = { version: 2; providers: Record<string, ProviderModelsCacheEntry> };
 
 function normalizeBaseUrlKey(v: unknown): string {
   return ensureTrailingSlash(normalizeString(v));
@@ -28,7 +25,7 @@ function normalizeCacheEntry(v: unknown): ProviderModelsCacheEntry | null {
   return { baseUrl, updatedAtMs, models };
 }
 
-function normalizeModelsCacheV1(v: unknown): ProviderModelsCacheV1 {
+function normalizeModelsCacheV2(v: unknown): ProviderModelsCacheV2 {
   const r = asRecord(v) || {};
   const providersRaw = asRecord(r.providers) || {};
   const providers: Record<string, ProviderModelsCacheEntry> = {};
@@ -37,13 +34,13 @@ function normalizeModelsCacheV1(v: unknown): ProviderModelsCacheV1 {
     const entry = normalizeCacheEntry(vv);
     if (id && entry) providers[id] = entry;
   }
-  return { version: 1, providers };
+  return { version: 2, providers };
 }
 
-export async function loadProviderModelsCacheRaw({ context }: { context: any }): Promise<ProviderModelsCacheV1> {
+export async function loadProviderModelsCacheRaw({ context }: { context: any }): Promise<ProviderModelsCacheV2> {
   assertGlobalState(context);
   const stored = await context.globalState.get(AUGMENT_BYOK.byokModelsCacheGlobalStateKey);
-  return normalizeModelsCacheV1(stored);
+  return normalizeModelsCacheV2(stored);
 }
 
 export async function getCachedProviderModels({

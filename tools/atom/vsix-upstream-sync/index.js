@@ -4,6 +4,7 @@
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { ensureDir, rmDir, readJson, writeJson } = require("../common/fs");
 
 const UPSTREAM = {
   publisher: "augment",
@@ -12,23 +13,10 @@ const UPSTREAM = {
     "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/augment/vsextensions/vscode-augment/latest/vspackage"
 };
 
-function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function rmDir(dirPath) {
-  if (!fs.existsSync(dirPath)) return;
-  fs.rmSync(dirPath, { recursive: true, force: true });
-}
-
 function run(cmd, args, { cwd }) {
   const r = spawnSync(cmd, args, { cwd, stdio: "inherit" });
   if (r.error) throw r.error;
   if (typeof r.status === "number" && r.status !== 0) throw new Error(`command failed: ${cmd} ${args.join(" ")}`);
-}
-
-function readJson(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
 async function downloadFile(url, outPath) {
@@ -56,15 +44,19 @@ function readUpstreamVersionFromUnpackedDir({ repoRoot, unpackDir }) {
 
 function writeUpstreamMeta({ repoRoot, unpackDir, meta }) {
   const outPath = path.join(unpackDir, ".upstream.json");
-  fs.writeFileSync(outPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
+  writeJson(outPath, meta);
   return path.relative(repoRoot, outPath);
 }
 
-async function syncUpstreamLatest({ repoRoot, cacheDir, loggerPrefix }) {
+async function syncUpstreamLatest({ repoRoot, cacheDir, loggerPrefix, unpackDir: unpackDirOverride, writeMeta = true }) {
   const prefix = typeof loggerPrefix === "string" ? loggerPrefix : "[upstream]";
   const upstreamDir = path.join(cacheDir, "upstream");
   const vsixPath = path.join(upstreamDir, `${UPSTREAM.publisher}.${UPSTREAM.extension}.latest.vsix`);
-  const unpackDir = path.join(upstreamDir, "unpacked", "latest");
+  const unpackDir = unpackDirOverride
+    ? path.isAbsolute(unpackDirOverride)
+      ? unpackDirOverride
+      : path.join(repoRoot, unpackDirOverride)
+    : path.join(cacheDir, "work", "upstream-latest");
 
   ensureDir(upstreamDir);
 
@@ -90,10 +82,10 @@ async function syncUpstreamLatest({ repoRoot, cacheDir, loggerPrefix }) {
     vsixPath: path.relative(repoRoot, vsixPath),
     unpackDir: path.relative(repoRoot, unpackDir)
   };
-  const metaRelPath = writeUpstreamMeta({ repoRoot, unpackDir, meta });
 
   console.log(`${prefix} ready: ${UPSTREAM.publisher}.${UPSTREAM.extension}@${version}`);
-  console.log(`${prefix} meta: ${metaRelPath}`);
+  const metaRelPath = writeMeta ? writeUpstreamMeta({ repoRoot, unpackDir, meta }) : "";
+  if (metaRelPath) console.log(`${prefix} meta: ${metaRelPath}`);
   console.log(`${prefix} path: ${path.relative(repoRoot, unpackDir)}`);
 
   return { vsixPath, unpackDir, version, meta };

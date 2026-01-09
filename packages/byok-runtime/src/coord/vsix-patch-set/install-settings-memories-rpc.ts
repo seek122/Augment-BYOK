@@ -142,7 +142,7 @@ function attachSettingsMemoriesHandlers({ vscode, context, panel, logger }: { vs
     const requestId = isAsyncWrapper && typeof msg.requestId === "string" ? msg.requestId : "";
     const baseMsg = isAsyncWrapper ? msg.baseMsg : msg;
     const baseType = baseMsg?.type;
-    if (baseType !== "load-memories-file" && baseType !== "save-memories-file") return;
+    if (baseType !== "load-memories-file-request" && baseType !== "save-memories-file-request") return;
 
     const postResponse = async (type: string, data: any) => {
       if (isAsyncWrapper) {
@@ -152,7 +152,7 @@ function attachSettingsMemoriesHandlers({ vscode, context, panel, logger }: { vs
       return await webview.postMessage({ type, data });
     };
 
-    if (baseType === "load-memories-file") {
+    if (baseType === "load-memories-file-request") {
       await runExclusive(async () => {
         try {
           if (!memoriesFilePath) throw new Error("Memories file path not available");
@@ -160,7 +160,7 @@ function attachSettingsMemoriesHandlers({ vscode, context, panel, logger }: { vs
           await postResponse("load-memories-file-response", payload);
         } catch (e: any) {
           const error = String(e?.message || e);
-          await postResponse("load-memories-file-response", { path: memoriesFilePath || "", content: "", error });
+          await postResponse("load-memories-file-response", { path: "", content: "", error });
           try {
             logger.warn?.(`[BYOK] load-memories-file failed: ${memoriesFilePath || "(no-path)"}: ${error}`);
           } catch {
@@ -170,7 +170,7 @@ function attachSettingsMemoriesHandlers({ vscode, context, panel, logger }: { vs
       });
     }
 
-    if (baseType === "save-memories-file") {
+    if (baseType === "save-memories-file-request") {
       await runExclusive(async () => {
         const content = typeof baseMsg?.data?.content === "string" ? baseMsg.data.content : "";
         try {
@@ -222,12 +222,7 @@ async function ensureMemoriesFile(filePath: string): Promise<void> {
 
 async function readMemoriesFile(filePath: string): Promise<{ path: string; content: string }> {
   await ensureMemoriesFile(filePath);
-  let content = "";
-  try {
-    content = await fs.promises.readFile(filePath, "utf8");
-  } catch {
-    content = "";
-  }
+  const content = await fs.promises.readFile(filePath, "utf8");
   return { path: filePath, content };
 }
 

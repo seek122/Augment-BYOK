@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { insertBeforeSourceMappingURL } = require("../../atom/common/patch");
 
 const MARKER = "__augment_byok_bootstrap_injected";
 
@@ -20,7 +21,7 @@ function patchExtensionEntry(filePath) {
   const activateVar = findActivateVar(original);
 
   const injection = `\n;require(\"./byok/entry/bootstrap-install\").install({vscode:require(\"vscode\"),getActivate:()=>${activateVar},setActivate:e=>{${activateVar}=e}})\n;/*${MARKER}*/\n`;
-  const next = original + injection;
+  const next = insertBeforeSourceMappingURL(original, injection);
 
   fs.writeFileSync(filePath, next, "utf8");
   return { changed: true, reason: "patched", activateVar };

@@ -1,14 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-function normalizePath(p) {
-  const s = typeof p === "string" ? p.trim() : "";
-  if (!s) return "";
-  const withSlash = s.startsWith("/") ? s : `/${s}`;
-  const clean = withSlash.replace(/\/+$/, "");
-  if (!clean || clean === "/") return "";
-  return clean;
-}
+const { normalizePath } = require("../common/url");
 
 function buildSnippet(src, index, radius) {
   const i = typeof index === "number" && Number.isFinite(index) ? index : 0;
@@ -109,4 +102,3 @@ module.exports = {
   topSegment,
   groupBySegment
 };
-

@@ -8,9 +8,8 @@ function normalizeString(v) {
 function buildBearerAuth(token) {
   const raw = normalizeString(token);
   if (!raw) return "";
-  if (/\s/.test(raw)) throw new Error("invalid --token (must be raw token; do not include 'Bearer ' prefix)");
+  if (/\s/.test(raw)) throw new Error("Token 格式错误：请填写 raw token（不包含 Bearer 前缀/空白）");
   return `Bearer ${raw}`;
 }
 
 module.exports = { buildBearerAuth };
-

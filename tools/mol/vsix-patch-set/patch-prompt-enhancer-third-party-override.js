@@ -4,6 +4,8 @@
 const fs = require("fs");
 const path = require("path");
 
+const { ensureMarker } = require("../../atom/common/patch");
+
 const MARKER = "__augment_byok_prompt_enhancer_third_party_override_patched";
 
 function findMatchingParen(src, openIndex) {
@@ -276,9 +278,10 @@ function patchPromptEnhancerThirdPartyOverride(filePath) {
     `if(__byokPmn)__byokTpo.provider_model_name=__byokPmn;` +
     `if(__byokKey)__byokTpo.api_key=__byokKey;` +
     `if(__byokBase)__byokTpo.base_url=__byokBase;` +
-    `if(Object.keys(__byokTpo).length){${bodyVar}=${bodyVar}&&typeof ${bodyVar}===\"object\"?{...${bodyVar},third_party_override:__byokTpo}:{third_party_override:__byokTpo};}}};/*${MARKER}*/`;
+    `if(Object.keys(__byokTpo).length){${bodyVar}=${bodyVar}&&typeof ${bodyVar}===\"object\"?{...${bodyVar},third_party_override:__byokTpo}:{third_party_override:__byokTpo};}}};`;
 
-  const next = original.slice(0, openBrace + 1) + injection + original.slice(openBrace + 1);
+  const patched = original.slice(0, openBrace + 1) + injection + original.slice(openBrace + 1);
+  const next = ensureMarker(patched, MARKER);
   fs.writeFileSync(filePath, next, "utf8");
   return { changed: true, reason: "patched", configVar, endpointVar, bodyVar };
 }

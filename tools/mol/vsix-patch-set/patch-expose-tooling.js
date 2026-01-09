@@ -4,6 +4,8 @@
 const fs = require("fs");
 const path = require("path");
 
+const { ensureMarker } = require("../../atom/common/patch");
+
 const MARKER = "__augment_byok_tooling_exposed";
 
 function patchExposeTooling(filePath) {
@@ -23,8 +25,9 @@ function patchExposeTooling(filePath) {
   const semi = original.indexOf(";", idx);
   if (semi === -1) throw new Error("failed to locate semicolon after this._toolsModel assignment");
 
-  const injection = `try{globalThis.__augment_byok_tooling??={};globalThis.__augment_byok_tooling.chatModel=this._chatModel;globalThis.__augment_byok_tooling.toolsModel=this._toolsModel}catch{};/*${MARKER}*/`;
-  const next = original.slice(0, semi + 1) + injection + original.slice(semi + 1);
+  const injection = `try{globalThis.__augment_byok_tooling??={};globalThis.__augment_byok_tooling.chatModel=this._chatModel;globalThis.__augment_byok_tooling.toolsModel=this._toolsModel}catch{};`;
+  const patched = original.slice(0, semi + 1) + injection + original.slice(semi + 1);
+  const next = ensureMarker(patched, MARKER);
   fs.writeFileSync(filePath, next, "utf8");
   return { changed: true, reason: "patched", index: idx };
 }
@@ -39,4 +42,3 @@ if (require.main === module) {
   }
   patchExposeTooling(p);
 }
-

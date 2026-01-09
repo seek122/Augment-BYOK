@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { ensureMarker } = require("../../atom/common/patch");
 
 const MARKER = "__augment_byok_api_token_preserve_case_patched";
 
@@ -16,7 +17,7 @@ function patchApiTokenPreserveCase(filePath) {
     throw new Error(`failed to locate apiToken normalization needle (upstream may have changed): ${needle}`);
   }
 
-  const next = original.replace(needle, 'apiToken:(t?.advanced?.apiToken??t.apiToken??"").trim()') + `\n;/*${MARKER}*/\n`;
+  const next = ensureMarker(original.replace(needle, 'apiToken:(t?.advanced?.apiToken??t.apiToken??"").trim()'), MARKER);
   fs.writeFileSync(filePath, next, "utf8");
   return { changed: true, reason: "patched" };
 }
@@ -31,4 +32,3 @@ if (require.main === module) {
   }
   patchApiTokenPreserveCase(p);
 }
-

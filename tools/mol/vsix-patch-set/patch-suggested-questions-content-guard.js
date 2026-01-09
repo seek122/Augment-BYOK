@@ -3,17 +3,20 @@
 
 const fs = require("fs");
 const path = require("path");
+const { ensureMarker } = require("../../atom/common/patch");
 
 const MARKER = "__augment_byok_suggested_questions_content_guard_patched";
-const NEEDLE = "find((C=>C.type===Yt.SUGGESTED_QUESTIONS))?.content.split(";
-const REPLACEMENT = "find((C=>C.type===Yt.SUGGESTED_QUESTIONS))?.content?.split(";
+const NEEDLE = "SUGGESTED_QUESTIONS))?.content.split(";
+const REPLACEMENT = "SUGGESTED_QUESTIONS))?.content?.split(";
 
 function patchFile(filePath) {
   if (!fs.existsSync(filePath)) throw new Error(`missing file: ${filePath}`);
   const original = fs.readFileSync(filePath, "utf8");
   if (original.includes(MARKER)) return { changed: false, reason: "already_patched" };
-  if (!original.includes(NEEDLE)) return { changed: false, reason: "no_match" };
-  const next = original.split(NEEDLE).join(REPLACEMENT) + `\n;/*${MARKER}*/\n`;
+  const count = original.split(NEEDLE).length - 1;
+  if (count === 0) return { changed: false, reason: "no_match" };
+  const next = ensureMarker(original.split(NEEDLE).join(REPLACEMENT), MARKER);
+  if (!next.includes(REPLACEMENT) || next.includes(NEEDLE) || !next.includes(MARKER)) throw new Error(`patch suggested-questions guard failed: ${path.basename(filePath)}`);
   fs.writeFileSync(filePath, next, "utf8");
   return { changed: true, reason: "patched" };
 }
@@ -30,7 +33,7 @@ function patchSuggestedQuestionsContentGuard({ extensionDir }) {
     if (r.reason !== "no_match") matched += 1;
     if (r.changed) changed += 1;
   }
-  if (changed === 0) throw new Error(`patch suggested-questions guard failed: needle not found in ${assetsDir}`);
+  if (matched === 0) throw new Error(`patch suggested-questions guard failed: needle not found in ${assetsDir}`);
   return { changed, matched, reason: "patched" };
 }
 
@@ -44,4 +47,3 @@ if (require.main === module) {
   }
   patchSuggestedQuestionsContentGuard({ extensionDir: extDir });
 }
-

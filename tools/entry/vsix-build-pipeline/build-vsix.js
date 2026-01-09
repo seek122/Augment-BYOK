@@ -16,46 +16,29 @@ const { patchSettingsSecretsWebview } = require("../../mol/vsix-patch-set/patch-
 const { patchPackageJsonByokPanelCommand } = require("../../mol/vsix-patch-set/patch-package-json-byok-panel-command");
 const { patchExposeTooling } = require("../../mol/vsix-patch-set/patch-expose-tooling");
 const { patchSuggestedQuestionsContentGuard } = require("../../mol/vsix-patch-set/patch-suggested-questions-content-guard");
+const { patchMainPanelErrorOverlay } = require("../../mol/vsix-patch-set/patch-main-panel-error-overlay");
 const { patchSubscriptionBannerNonfatal } = require("../../mol/vsix-patch-set/patch-subscription-banner-nonfatal");
+const { patchWebviewMessageTimeoutGuard } = require("../../mol/vsix-patch-set/patch-webview-message-timeout-guard");
 
-const { UPSTREAM, ensureDir, run, syncUpstreamLatest } = require("../../atom/upstream-vsix");
-
-function rmDir(dirPath) {
-  if (!fs.existsSync(dirPath)) return;
-  fs.rmSync(dirPath, { recursive: true, force: true });
-}
-
-function copyDir(srcDir, dstDir) {
-  if (!fs.existsSync(srcDir)) return;
-  ensureDir(dstDir);
-  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
-    const src = path.join(srcDir, entry.name);
-    const dst = path.join(dstDir, entry.name);
-    if (entry.isDirectory()) copyDir(src, dst);
-    else if (entry.isFile()) fs.copyFileSync(src, dst);
-  }
-}
-
-function readJson(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
+const { UPSTREAM, ensureDir, run, syncUpstreamLatest } = require("../../atom/vsix-upstream-sync");
+const { copyDir, readJson, rmDir } = require("../../atom/common/fs");
 
 async function main() {
   const repoRoot = path.resolve(__dirname, "../../..");
   const cacheDir = path.join(repoRoot, ".cache");
-  const workDir = path.join(cacheDir, "work", String(Date.now()));
+  const workRoot = path.join(cacheDir, "work");
+  const workDir = path.join(workRoot, "latest");
   const payloadDir = path.join(cacheDir, "payload", "extension");
   const distDir = path.join(repoRoot, "dist");
 
   ensureDir(distDir);
 
-  const synced = await syncUpstreamLatest({ repoRoot, cacheDir, loggerPrefix: "[build]" });
-  const upstreamUnpackedDir = synced.unpackDir;
-  const upstreamVersion = synced.version;
-
+  rmDir(workRoot);
   ensureDir(workDir);
+
   console.log(`[build] staging workdir -> ${path.relative(repoRoot, workDir)}`);
-  copyDir(upstreamUnpackedDir, workDir);
+  const synced = await syncUpstreamLatest({ repoRoot, cacheDir, loggerPrefix: "[build]", unpackDir: workDir, writeMeta: false });
+  const upstreamVersion = synced.version;
 
   const extensionDir = path.join(workDir, "extension");
   const pkgPath = path.join(extensionDir, "package.json");
@@ -98,8 +81,14 @@ async function main() {
   console.log(`[build] patch suggested questions content guard`);
   patchSuggestedQuestionsContentGuard({ extensionDir });
 
+  console.log(`[build] patch main panel error overlay`);
+  patchMainPanelErrorOverlay(path.join(extensionDir, "common-webviews", "main-panel.html"));
+
   console.log(`[build] patch subscription banner nonfatal`);
   patchSubscriptionBannerNonfatal(path.join(extensionDir, "out", "extension.js"));
+
+  console.log(`[build] patch webview message timeout guard (rules/analytics/subscription)`);
+  patchWebviewMessageTimeoutGuard(path.join(extensionDir, "out", "extension.js"));
 
   console.log(`[build] patch package.json BYOK panel command`);
   patchPackageJsonByokPanelCommand(pkgPath);
@@ -111,9 +100,15 @@ async function main() {
   const outPath = path.join(distDir, outName);
 
   console.log(`[build] repack VSIX -> ${path.relative(repoRoot, outPath)}`);
-  run("python3", [path.join(repoRoot, "tools", "atom", "zip-dir.py"), "--src", workDir, "--out", outPath], { cwd: repoRoot });
+  run("python3", [path.join(repoRoot, "tools", "atom", "common", "zip-dir.py"), "--src", workDir, "--out", outPath], { cwd: repoRoot });
 
   console.log(`[build] done: ${path.relative(repoRoot, outPath)}`);
+
+  const keepWorkDir = process.env.AUGMENT_BYOK_KEEP_WORKDIR === "1";
+  if (!keepWorkDir) {
+    console.log(`[build] cleanup workdir -> ${path.relative(repoRoot, workRoot)}`);
+    rmDir(workRoot);
+  }
 }
 
 main().catch((err) => {
