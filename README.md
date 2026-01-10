@@ -50,6 +50,8 @@
 - `pnpm clean:cache --deps`：额外删除 `.cache/pnpm-store/`、`.cache/npm/`、`.pnpm-store/`
 - `pnpm clean:cache --all`：删除整个 `.cache/`
 - `pnpm clean:vscode:workspace`：删除本仓库对应的 VS Code `workspaceStorage/<hash>/`（用于避免工作区缓存影响 VSIX 联调/测试）
+- `pnpm clean:vscode:augment`：删除 VS Code `globalStorage/augment.vscode-augment/`（重置 Augment 扩展的缓存/文件；不触碰 secrets/globalState DB）
+- `pnpm clean:vscode:reset`：一键重置（依次执行 `clean:vscode:workspace` + `clean:vscode:augment`）
 
 可选参数（便于未来切换 relay/profile）：
 - `pnpm check:matrix -- --profile config/relay-profiles/<id>.json`
