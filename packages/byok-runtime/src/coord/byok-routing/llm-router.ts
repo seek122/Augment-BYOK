@@ -256,37 +256,161 @@ function normalizeNextEditLocationCandidates(v: unknown, { fallbackPath, maxCoun
   return out;
 }
 
-function normalizeRequestId(v: unknown): string {
-  return typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim();
-}
-
-function getToolingOrThrow(): { toolsModel: any; chatModel: any } {
-  const tooling = (globalThis as any).__augment_byok_tooling;
-  const toolsModel = tooling?.toolsModel;
-  const chatModel = tooling?.chatModel;
-  if (!toolsModel || !chatModel) throw new Error("BYOK 工具系统未就绪（请先打开一次 Augment 主面板以完成初始化）");
-  return { toolsModel, chatModel };
-}
-
 function getChatHistory(body: Record<string, any>): any[] {
   const v = body.chat_history ?? body.chatHistory;
   return Array.isArray(v) ? v.filter((x) => x && typeof x === "object") : [];
 }
 
-function getConversationId(body: Record<string, any>): string {
-  return normalizeString(body.conversation_id ?? body.conversationId ?? "");
+type ToolUseLike = { toolUseId: string; toolName: string; inputJson: string };
+type ToolResultLike = { toolUseId: string; content: string; isError: boolean };
+
+function getRequestNodes(body: Record<string, any>): any[] {
+  return Array.isArray(body.nodes) ? body.nodes.filter((x) => x && typeof x === "object") : [];
 }
 
-function normalizeChatHistoryPairs(history: any[]): Array<{ user: string; assistant: string }> {
-  const out: Array<{ user: string; assistant: string }> = [];
-  for (const ex of history) {
-    const r = (asRecord(ex) as any) || {};
-    const user = normalizeString(r.request_message ?? r.requestMessage ?? r.message ?? "");
-    const assistant = normalizeString(r.response_text ?? r.responseText ?? r.response ?? r.text ?? "");
-    if (!user && !assistant) continue;
-    out.push({ user, assistant });
+function getExchangeUserText(ex: Record<string, any>): string {
+  return normalizeString(ex.request_message ?? ex.requestMessage ?? ex.message ?? "");
+}
+
+function getExchangeAssistantText(ex: Record<string, any>): string {
+  return normalizeString(ex.response_text ?? ex.responseText ?? ex.response ?? ex.text ?? "");
+}
+
+function getExchangeRequestNodes(ex: Record<string, any>): any[] {
+  const v =
+    ex.structured_request_nodes ??
+    ex.structuredRequestNodes ??
+    ex.request_nodes ??
+    ex.requestNodes ??
+    ex.nodes ??
+    ex.request_node ??
+    ex.requestNode;
+  return Array.isArray(v) ? v.filter((x) => x && typeof x === "object") : [];
+}
+
+function getExchangeOutputNodes(ex: Record<string, any>): any[] {
+  const v = ex.structured_output_nodes ?? ex.structuredOutputNodes ?? ex.response_nodes ?? ex.responseNodes;
+  return Array.isArray(v) ? v.filter((x) => x && typeof x === "object") : [];
+}
+
+function normalizeIsErrorFlag(v: unknown): boolean {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") return ["true", "1", "yes"].includes(v.trim().toLowerCase());
+  return false;
+}
+
+function extractToolResultsFromRequestNodes(nodes: any[]): ToolResultLike[] {
+  const out: ToolResultLike[] = [];
+  for (const n of nodes) {
+    const r = (asRecord(n) as any) || {};
+    if (Number(r.type) !== 1) continue;
+    const tr = (asRecord(r.tool_result_node) as any) || {};
+    const toolUseId = normalizeString(tr.tool_use_id ?? tr.toolUseId);
+    if (!toolUseId) continue;
+    out.push({ toolUseId, content: normalizeString(tr.content), isError: normalizeIsErrorFlag(tr.is_error ?? tr.isError) });
   }
   return out;
+}
+
+function extractToolUsesFromOutputNodes(nodes: any[]): ToolUseLike[] {
+  const out: ToolUseLike[] = [];
+  for (const n of nodes) {
+    const r = (asRecord(n) as any) || {};
+    const t = Number(r.type);
+    if (t !== 5 && t !== 7) continue;
+    const tu = (asRecord(r.tool_use) as any) || {};
+    const toolUseId = normalizeString(tu.tool_use_id ?? tu.toolUseId);
+    const toolName = normalizeString(tu.tool_name ?? tu.toolName);
+    const inputJson = normalizeString(tu.input_json ?? tu.inputJson) || "{}";
+    if (!toolUseId || !toolName) continue;
+    out.push({ toolUseId, toolName, inputJson });
+  }
+  return out;
+}
+
+function buildOpenAiMessagesForToolCalling({
+  system,
+  chatHistory,
+  currentUserText,
+  currentRequestNodes
+}: {
+  system: string;
+  chatHistory: any[];
+  currentUserText: string;
+  currentRequestNodes: any[];
+}): any[] {
+  const messages: any[] = [];
+  if (system) messages.push({ role: "system", content: system });
+  for (const ex of chatHistory) {
+    const r = (asRecord(ex) as any) || {};
+    const userText = getExchangeUserText(r);
+    const assistantText = getExchangeAssistantText(r);
+    const toolUses = extractToolUsesFromOutputNodes(getExchangeOutputNodes(r));
+    const toolResults = extractToolResultsFromRequestNodes(getExchangeRequestNodes(r));
+
+    if (userText) messages.push({ role: "user", content: userText });
+    if (toolUses.length) {
+      messages.push({
+        role: "assistant",
+        content: assistantText || "",
+        tool_calls: toolUses.map((tu) => ({ id: tu.toolUseId, type: "function", function: { name: tu.toolName, arguments: tu.inputJson } }))
+      });
+    } else if (assistantText) {
+      messages.push({ role: "assistant", content: assistantText });
+    }
+    for (const tr of toolResults) messages.push({ role: "tool", tool_call_id: tr.toolUseId, content: tr.content });
+  }
+  if (currentUserText) messages.push({ role: "user", content: currentUserText });
+  for (const tr of extractToolResultsFromRequestNodes(currentRequestNodes)) messages.push({ role: "tool", tool_call_id: tr.toolUseId, content: tr.content });
+  return messages;
+}
+
+function parseJsonObjectOrThrow({ label, json }: { label: string; json: string }): Record<string, any> {
+  const raw = normalizeString(json) || "{}";
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, any>;
+  } catch {
+    // fall through
+  }
+  throw new Error(`${label} 不是合法 JSON 对象: ${raw.replace(/\s+/g, " ").slice(0, 200)}`.trim());
+}
+
+function buildAnthropicMessagesForToolCalling({
+  chatHistory,
+  currentUserText,
+  currentRequestNodes
+}: {
+  chatHistory: any[];
+  currentUserText: string;
+  currentRequestNodes: any[];
+}): any[] {
+  const messages: any[] = [];
+  const pushUser = ({ text, toolResults }: { text: string; toolResults: ToolResultLike[] }) => {
+    const blocks: any[] = [];
+    if (text) blocks.push({ type: "text", text });
+    for (const tr of toolResults) blocks.push({ type: "tool_result", tool_use_id: tr.toolUseId, content: tr.content, is_error: tr.isError });
+    if (blocks.length === 0) return;
+    messages.push({ role: "user", content: blocks.length === 1 && blocks[0].type === "text" ? blocks[0].text : blocks });
+  };
+  const pushAssistant = ({ text, toolUses }: { text: string; toolUses: ToolUseLike[] }) => {
+    if (!toolUses.length) {
+      if (text) messages.push({ role: "assistant", content: text });
+      return;
+    }
+    const blocks: any[] = [];
+    if (text) blocks.push({ type: "text", text });
+    for (const tu of toolUses) blocks.push({ type: "tool_use", id: tu.toolUseId, name: tu.toolName, input: parseJsonObjectOrThrow({ label: `Tool(${tu.toolName}) input_json`, json: tu.inputJson }) });
+    messages.push({ role: "assistant", content: blocks });
+  };
+  for (const ex of chatHistory) {
+    const r = (asRecord(ex) as any) || {};
+    pushUser({ text: getExchangeUserText(r), toolResults: extractToolResultsFromRequestNodes(getExchangeRequestNodes(r)) });
+    pushAssistant({ text: getExchangeAssistantText(r), toolUses: extractToolUsesFromOutputNodes(getExchangeOutputNodes(r)) });
+  }
+  pushUser({ text: currentUserText, toolResults: extractToolResultsFromRequestNodes(currentRequestNodes) });
+  return messages;
 }
 
 function getToolDefinitions(body: Record<string, any>): any[] {
@@ -320,52 +444,6 @@ function toAnthropicTools(toolDefs: any[]): AnthropicTool[] {
 
 function toolUseNode({ id, toolUseId, toolName, inputJson }: { id: number; toolUseId: string; toolName: string; inputJson: string }): any {
   return { id, type: 5, tool_use: { tool_use_id: toolUseId, tool_name: toolName, input_json: inputJson } };
-}
-
-async function runAugmentTool({
-  toolsModel,
-  chatModel,
-  chatRequestId,
-  toolUseId,
-  toolName,
-  input,
-  chatHistory,
-  conversationId
-}: {
-  toolsModel: any;
-  chatModel: any;
-  chatRequestId: string;
-  toolUseId: string;
-  toolName: string;
-  input: any;
-  chatHistory: any[];
-  conversationId?: string;
-}): Promise<{ text: string; isError: boolean }> {
-  if (typeof toolsModel?.findToolDefinitionByName !== "function" || typeof toolsModel?.callTool !== "function") throw new Error("BYOK 工具系统异常：toolsModel 未暴露 findToolDefinitionByName/callTool");
-  if (typeof chatModel?.hydrateChatHistory !== "function" || typeof chatModel?.limitChatHistory !== "function") throw new Error("BYOK 工具系统异常：chatModel 未暴露 hydrateChatHistory/limitChatHistory");
-  if (typeof chatModel?.onPreToolUse !== "function" || typeof chatModel?.onPostToolUse !== "function") throw new Error("BYOK 工具系统异常：chatModel 未暴露 onPreToolUse/onPostToolUse");
-
-  const toolDef = (await toolsModel.findToolDefinitionByName(toolName))?.definition;
-  const pre = await chatModel.onPreToolUse(toolName, input, conversationId, toolDef);
-  if (!(pre?.shouldContinue ?? true)) {
-    const msg = pre?.blockingMessage ? `${pre.blockingMessage}\n\nPreToolUse:${toolName} hook returned blocking error` : `Tool execution blocked by hook: ${toolName}`;
-    return { text: msg, isError: true };
-  }
-  const hydrated = await chatModel.hydrateChatHistory(chatHistory);
-  const limited = chatModel.limitChatHistory(hydrated);
-  const out = await toolsModel.callTool(chatRequestId, toolUseId, toolName, input, limited, conversationId);
-  const post = await chatModel.onPostToolUse(toolName, input, out?.text, out?.isError ? out?.text : undefined, conversationId, toolDef);
-  if (post?.agentMessages?.length && out && typeof out.text === "string") out.text = `${out.text}\n\n[Hook Context]\n${post.agentMessages.join("\n")}`;
-  const rawIsError = out?.isError;
-  const isError =
-    typeof rawIsError === "boolean"
-      ? rawIsError
-      : typeof rawIsError === "number"
-        ? rawIsError !== 0
-        : typeof rawIsError === "string"
-          ? ["true", "1", "yes"].includes(rawIsError.trim().toLowerCase())
-          : false;
-  return { text: normalizeString(out?.text), isError };
 }
 
 async function completeText({
@@ -784,11 +862,8 @@ export async function maybeHandleCallApiStream({
       return gen();
     }
 
-    const { toolsModel, chatModel } = getToolingOrThrow();
     const chatHistory = getChatHistory(request);
-    const historyPairs = normalizeChatHistoryPairs(chatHistory);
-    const conversationId = getConversationId(request) || undefined;
-    const chatRequestId = normalizeRequestId(requestId) || `byok-${Date.now()}`;
+    const requestNodes = getRequestNodes(request);
 
     const provider = resolvedProvider;
     const baseUrl = normalizeString(provider.baseUrl);
@@ -803,115 +878,61 @@ export async function maybeHandleCallApiStream({
 
       if (provider.type === "openai_compatible") {
         const tools = toOpenAiTools(toolDefs);
-        let messages: any[] = [];
-        if (system) messages.push({ role: "system", content: system });
-        for (const h of historyPairs) {
-          if (h.user) messages.push({ role: "user", content: h.user });
-          if (h.assistant) messages.push({ role: "assistant", content: h.assistant });
-        }
-        messages.push({ role: "user", content: user });
-
-        for (let turn = 0; turn < 25; turn++) {
-          throwIfAborted(abortSignal);
-          const res = await openAiChatCompleteWithTools({
-            baseUrl,
-            apiKey,
-            model,
-            messages,
-            tools,
-            timeoutMs: tmo,
-            abortSignal
-          });
-          if (res.kind === "tool_calls") {
-            if (res.assistantText) yield transform({ text: res.assistantText, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
-            messages = messages.concat([{ role: "assistant", content: res.assistantText || "", tool_calls: res.toolCalls }]);
-            for (const tc of res.toolCalls) {
-              throwIfAborted(abortSignal);
-              const toolName = normalizeString(tc?.function?.name);
-              const toolUseId = normalizeString(tc?.id) || `byok-tool-${Date.now()}-${nodeId}`;
-              const argsRaw = tc?.function?.arguments;
-              const inputJson = typeof argsRaw === "string" ? argsRaw : argsRaw && typeof argsRaw === "object" ? JSON.stringify(argsRaw) : "{}";
-              let input: any;
-              try {
-                input = typeof argsRaw === "object" && argsRaw ? argsRaw : inputJson ? JSON.parse(inputJson) : {};
-              } catch {
-                throw new Error(`Tool(${toolName}) arguments 不是合法 JSON: ${inputJson.slice(0, 200)}`);
-              }
-
-              yield transform({
-                text: "",
-                unknown_blob_names: [],
-                checkpoint_not_found: false,
-                workspace_file_chunks: [],
-                nodes: [toolUseNode({ id: nodeId++, toolUseId, toolName, inputJson })]
-              });
-
-              const out = await runAugmentTool({ toolsModel, chatModel, chatRequestId, toolUseId, toolName, input, chatHistory, conversationId });
-              throwIfAborted(abortSignal);
-
-              messages = messages.concat([{ role: "tool", tool_call_id: toolUseId, content: out.text }]);
+        const messages = buildOpenAiMessagesForToolCalling({ system, chatHistory, currentUserText: user, currentRequestNodes: requestNodes });
+        throwIfAborted(abortSignal);
+        const res = await openAiChatCompleteWithTools({ baseUrl, apiKey, model, messages, tools, timeoutMs: tmo, abortSignal });
+        if (res.kind === "tool_calls") {
+          if (res.assistantText) yield transform({ text: res.assistantText, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
+          for (const tc of res.toolCalls) {
+            throwIfAborted(abortSignal);
+            const toolName = normalizeString(tc?.function?.name);
+            const toolUseId = normalizeString(tc?.id) || `byok-tool-${Date.now()}-${nodeId}`;
+            const argsRaw = tc?.function?.arguments;
+            const inputJson = typeof argsRaw === "string" ? argsRaw : argsRaw && typeof argsRaw === "object" ? JSON.stringify(argsRaw) : "{}";
+            try {
+              JSON.parse(inputJson || "{}");
+            } catch {
+              throw new Error(`Tool(${toolName}) arguments 不是合法 JSON: ${inputJson.slice(0, 200)}`);
             }
-            continue;
+            yield transform({
+              text: "",
+              unknown_blob_names: [],
+              checkpoint_not_found: false,
+              workspace_file_chunks: [],
+              nodes: [toolUseNode({ id: nodeId++, toolUseId, toolName, inputJson })]
+            });
           }
-          yield transform({ text: res.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
           return;
         }
-        throw new Error("工具调用轮次过多，已中止");
+        yield transform({ text: res.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
+        return;
       }
 
       if (provider.type === "anthropic_native") {
         const tools = toAnthropicTools(toolDefs);
         const maxTokens = 1024;
-        let messages: any[] = [];
-        for (const h of historyPairs) {
-          if (h.user) messages.push({ role: "user", content: h.user });
-          if (h.assistant) messages.push({ role: "assistant", content: h.assistant });
-        }
-        messages.push({ role: "user", content: user });
-
-        for (let turn = 0; turn < 25; turn++) {
-          throwIfAborted(abortSignal);
-          const res = await anthropicCompleteWithTools({
-            baseUrl,
-            apiKey,
-            model,
-            system: system || undefined,
-            messages,
-            tools,
-            maxTokens,
-            timeoutMs: tmo,
-            abortSignal
-          });
-          if (res.kind === "tool_calls") {
-            if (res.assistantText) yield transform({ text: res.assistantText, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
-            messages = messages.concat([{ role: "assistant", content: res.contentBlocks }]);
-            const toolResults: any[] = [];
-            for (const tu of res.toolUses) {
-              throwIfAborted(abortSignal);
-              const toolName = normalizeString(tu.name);
-              const toolUseId = normalizeString(tu.id) || `byok-tool-${Date.now()}-${nodeId}`;
-              const inputJson = JSON.stringify(tu.input ?? {});
-
-              yield transform({
-                text: "",
-                unknown_blob_names: [],
-                checkpoint_not_found: false,
-                workspace_file_chunks: [],
-                nodes: [toolUseNode({ id: nodeId++, toolUseId, toolName, inputJson })]
-              });
-
-              const out = await runAugmentTool({ toolsModel, chatModel, chatRequestId, toolUseId, toolName, input: tu.input ?? {}, chatHistory, conversationId });
-              throwIfAborted(abortSignal);
-
-              toolResults.push({ type: "tool_result", tool_use_id: toolUseId, content: out.text, is_error: out.isError });
-            }
-            messages = messages.concat([{ role: "user", content: toolResults }]);
-            continue;
+        const messages = buildAnthropicMessagesForToolCalling({ chatHistory, currentUserText: user, currentRequestNodes: requestNodes });
+        throwIfAborted(abortSignal);
+        const res = await anthropicCompleteWithTools({ baseUrl, apiKey, model, system: system || undefined, messages, tools, maxTokens, timeoutMs: tmo, abortSignal });
+        if (res.kind === "tool_calls") {
+          if (res.assistantText) yield transform({ text: res.assistantText, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
+          for (const tu of res.toolUses) {
+            throwIfAborted(abortSignal);
+            const toolName = normalizeString(tu.name);
+            const toolUseId = normalizeString(tu.id) || `byok-tool-${Date.now()}-${nodeId}`;
+            const inputJson = JSON.stringify(tu.input ?? {});
+            yield transform({
+              text: "",
+              unknown_blob_names: [],
+              checkpoint_not_found: false,
+              workspace_file_chunks: [],
+              nodes: [toolUseNode({ id: nodeId++, toolUseId, toolName, inputJson })]
+            });
           }
-          yield transform({ text: res.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
           return;
         }
-        throw new Error("工具调用轮次过多，已中止");
+        yield transform({ text: res.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
+        return;
       }
 
       throw new Error(`未知 Provider type: ${String((provider as any).type)}`);
