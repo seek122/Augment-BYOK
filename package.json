@@ -8,6 +8,7 @@
     "build:payload": "node tools/entry/payload-build/build-payload.js",
     "build:vsix": "node tools/entry/payload-build/build-payload.js && node tools/entry/vsix-build-pipeline/build-vsix.js",
     "clean:cache": "node tools/entry/vsix-build-pipeline/clean-cache.js",
+    "clean:vscode:workspace": "node tools/entry/vsix-build-pipeline/clean-vscode-workspace-cache.js --apply",
     "upstream:sync": "node tools/entry/vsix-upstream-sync/sync.js",
     "upstream:analyze": "node tools/entry/upstream-analysis/analyze.js",
     "check:matrix": "node tools/entry/endpoint-coverage/endpoint-coverage.js",

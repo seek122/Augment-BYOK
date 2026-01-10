@@ -49,6 +49,7 @@
 - `pnpm clean:cache`：删除 `.cache/work/`、`.cache/tmp/`、`.cache/upstream/unpacked/`（保留下载的 VSIX）
 - `pnpm clean:cache --deps`：额外删除 `.cache/pnpm-store/`、`.cache/npm/`、`.pnpm-store/`
 - `pnpm clean:cache --all`：删除整个 `.cache/`
+- `pnpm clean:vscode:workspace`：删除本仓库对应的 VS Code `workspaceStorage/<hash>/`（用于避免工作区缓存影响 VSIX 联调/测试）
 
 可选参数（便于未来切换 relay/profile）：
 - `pnpm check:matrix -- --profile config/relay-profiles/<id>.json`
