@@ -81,7 +81,7 @@ jobs:
 
       - name: Skip (already released)
         if: steps.check_release.outputs.exists == 'true'
-        run: echo "Skip: ${TAG_NAME} already released."
+        run: 'echo "Skip: ${TAG_NAME} already released."'
 
       - name: Endpoint coverage matrix (audit)
         if: steps.check_release.outputs.exists != 'true'
