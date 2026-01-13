@@ -13,7 +13,7 @@ function patchChatStreamForwardInject(filePath) {
   if (original.includes(MARKER)) return { changed: false, reason: "already_patched" };
 
   const repoRoot = path.resolve(__dirname, "../../..");
-  const injectPath = path.join(repoRoot, "references", "Augment-BYOK-Proxy", "vsix-patch", "chat-stream-forward-inject.js");
+  const injectPath = path.join(repoRoot, "tools", "mol", "vsix-patch-set", "vendor", "chat-stream-forward-inject.js");
   if (!fs.existsSync(injectPath)) throw new Error(`missing inject source: ${path.relative(repoRoot, injectPath)}`);
   const code = fs.readFileSync(injectPath, "utf8");
   if (!code.includes("ChatStreamForward")) throw new Error("chat-stream-forward inject source unexpected (missing ChatStreamForward)");

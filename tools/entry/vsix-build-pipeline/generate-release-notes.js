@@ -7,11 +7,12 @@ const path = require("path");
 const { readJson, writeText } = require("../../atom/common/fs");
 
 function parseArgs(argv) {
-  const out = { manifestPath: "", outPath: "" };
+  const out = { manifestPath: "", outPath: "", tagName: "" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--manifest") out.manifestPath = argv[++i] || "";
     else if (a === "--out") out.outPath = argv[++i] || "";
+    else if (a === "--tag") out.tagName = argv[++i] || "";
   }
   return out;
 }
@@ -31,10 +32,10 @@ function mdCode(s) {
   return v ? `\`${v}\`` : "`(empty)`";
 }
 
-function buildLines(manifest) {
+function buildLines(manifest, { tagNameOverride } = {}) {
   const upstream = manifest?.upstream || {};
   const upstreamVersion = normalizeString(upstream.version) || "unknown";
-  const tagName = `upstream-${upstreamVersion}`;
+  const tagName = normalizeString(tagNameOverride) || `upstream-${upstreamVersion}`;
 
   const vsix = manifest?.artifacts?.vsix || {};
   const vsixFileName = normalizeString(vsix.fileName);
@@ -94,11 +95,6 @@ function buildLines(manifest) {
     for (const m of markers) lines.push(`- ${mdCode(m)}`);
   }
 
-  lines.push("");
-  lines.push("## Compliance");
-  lines.push("本制品仅用于 BYOK 合规替代与审计（降低非关键轮询/404 噪音、显式开关、日志与告警）。");
-  lines.push("明确禁止并不会实现：任何风控绕过/反检测/指纹改写/会话伪造/伪造签名。");
-
   return lines.join("\n") + "\n";
 }
 
@@ -112,7 +108,7 @@ function main() {
   if (!fs.existsSync(resolvedManifestPath)) throw new Error(`manifest not found: ${path.relative(repoRoot, resolvedManifestPath)}`);
 
   const manifest = readJson(resolvedManifestPath);
-  const md = buildLines(manifest);
+  const md = buildLines(manifest, { tagNameOverride: args.tagName });
 
   const outPath = normalizeString(args.outPath);
   if (outPath) {
@@ -131,4 +127,3 @@ try {
   console.error(`[release-notes] ERROR:`, err && err.stack ? err.stack : String(err));
   process.exit(1);
 }
-

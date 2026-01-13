@@ -6,7 +6,6 @@ import { buildAbortSignal, buildBearerAuthHeader, joinBaseUrl, normalizeEndpoint
 import { asRecord } from "../../atom/common/object";
 import { anthropicComplete, anthropicStreamEvents, type AnthropicTool } from "../../atom/byok-providers/anthropic-native";
 import { codexChatStreamEventsWithTools, codexResponsesCompleteText, codexResponsesStreamEvents } from "../../atom/byok-providers/codex-native";
-import { geminiCliCompleteText, geminiCliStreamEvents } from "../../atom/byok-providers/gemini-cli";
 import type { ByokStreamEvent } from "../../atom/byok-providers/stream-events";
 import { openAiChatComplete, openAiChatStreamEvents, type OpenAiTool } from "../../atom/byok-providers/openai-compatible";
 
@@ -173,13 +172,21 @@ function buildUserText(body: Record<string, any>): string {
   add("Path", body.path);
   add("Language", body.lang);
   add("Instruction", body.instruction);
-  add("Message", body.message);
+  const message = normalizeString(body.message);
+  if (message && !isUserPlaceholderMessage(message)) add("Message", message);
   add("Prompt", body.prompt);
   add("Prefix", body.prefix);
   add("Selected Text", body.selected_text ?? body.selected_code);
   add("Suffix", body.suffix);
   add("Diff", body.diff);
   return parts.join("\n\n").trim();
+}
+
+function isUserPlaceholderMessage(message: string): boolean {
+  const s = normalizeString(message);
+  if (!s) return false;
+  if (!/^-+$/.test(s)) return false;
+  return s.length <= 16;
 }
 
 function stripMarkdownFences(text: string): string {
@@ -265,7 +272,8 @@ function getChatHistory(body: Record<string, any>): any[] {
 }
 
 type ToolUseLike = { toolUseId: string; toolName: string; inputJson: string };
-type ToolResultLike = { toolUseId: string; content: string; isError: boolean };
+type UserContentItem = { kind: "text"; text: string } | { kind: "image"; mimeType: string; data: string };
+type ToolResultLike = { toolUseId: string; contentText: string; contentItems: UserContentItem[]; isError: boolean };
 
 function getRequestNodes(body: Record<string, any>): any[] {
   return Array.isArray(body.nodes) ? body.nodes.filter((x) => x && typeof x === "object") : [];
@@ -303,15 +311,48 @@ function normalizeIsErrorFlag(v: unknown): boolean {
   return false;
 }
 
+function parseChatRequestContentNodes(v: unknown): UserContentItem[] {
+  const nodes = Array.isArray(v) ? v : [];
+  const out: UserContentItem[] = [];
+  let lastText = "";
+  for (const n of nodes) {
+    const r = (asRecord(n) as any) || {};
+    const t = Number(r.type);
+    if (t === 1) {
+      const text = normalizeString(r.text_content ?? r.textContent);
+      if (!text || isUserPlaceholderMessage(text)) continue;
+      if (normalizeString(lastText) === text) continue;
+      out.push({ kind: "text", text });
+      lastText = text;
+      continue;
+    }
+    if (t === 2) {
+      const img = (asRecord(r.image_content ?? r.imageContent) as any) || {};
+      const data = normalizeString(img.image_data ?? img.imageData);
+      if (!data) continue;
+      out.push({ kind: "image", mimeType: mapImageFormatToMimeType(Number(img.format)), data });
+      lastText = "";
+    }
+  }
+  return out;
+}
+
 function extractToolResultsFromRequestNodes(nodes: any[]): ToolResultLike[] {
   const out: ToolResultLike[] = [];
   for (const n of nodes) {
     const r = (asRecord(n) as any) || {};
     if (Number(r.type) !== 1) continue;
-    const tr = (asRecord(r.tool_result_node) as any) || {};
+    const tr = (asRecord(r.tool_result_node ?? r.toolResultNode) as any) || {};
     const toolUseId = normalizeString(tr.tool_use_id ?? tr.toolUseId);
     if (!toolUseId) continue;
-    out.push({ toolUseId, content: normalizeString(tr.content), isError: normalizeIsErrorFlag(tr.is_error ?? tr.isError) });
+    const contentItems = parseChatRequestContentNodes(tr.content_nodes ?? tr.contentNodes);
+    const contentTextFromNodes = contentItems.filter((x) => x.kind === "text").map((x: any) => x.text).filter(Boolean).join("\n\n").trim();
+    const fallbackText = normalizeString(tr.content);
+    const contentText =
+      contentTextFromNodes ||
+      fallbackText ||
+      (contentItems.some((x) => x.kind === "image") ? `[ToolResult:${toolUseId}] (image content)` : "");
+    out.push({ toolUseId, contentText, contentItems, isError: normalizeIsErrorFlag(tr.is_error ?? tr.isError) });
   }
   return out;
 }
@@ -322,7 +363,7 @@ function extractToolUsesFromOutputNodes(nodes: any[]): ToolUseLike[] {
     const r = (asRecord(n) as any) || {};
     const t = Number(r.type);
     if (t !== 5 && t !== 7) continue;
-    const tu = (asRecord(r.tool_use) as any) || {};
+    const tu = (asRecord(r.tool_use ?? r.toolUse) as any) || {};
     const toolUseId = normalizeString(tu.tool_use_id ?? tu.toolUseId);
     const toolName = normalizeString(tu.tool_name ?? tu.toolName);
     const inputJson = normalizeString(tu.input_json ?? tu.inputJson) || "{}";
@@ -330,6 +371,330 @@ function extractToolUsesFromOutputNodes(nodes: any[]): ToolUseLike[] {
     out.push({ toolUseId, toolName, inputJson });
   }
   return out;
+}
+
+function mapImageFormatToMimeType(format: number): string {
+  if (format === 2) return "image/jpeg";
+  if (format === 3) return "image/gif";
+  if (format === 4) return "image/webp";
+  return "image/png";
+}
+
+function personaTypeToLabel(v: unknown): string {
+  const n = Number(v);
+  if (n === 1) return "PROTOTYPER";
+  if (n === 2) return "BRAINSTORM";
+  if (n === 3) return "REVIEWER";
+  return "DEFAULT";
+}
+
+function formatIdeStateForPrompt(v: unknown): string {
+  const ide = (asRecord(v) as any) || {};
+  const folders = Array.isArray(ide.workspace_folders ?? ide.workspaceFolders) ? (ide.workspace_folders ?? ide.workspaceFolders) : [];
+  const unchanged = ide.workspace_folders_unchanged ?? ide.workspaceFoldersUnchanged;
+  const term = (asRecord(ide.current_terminal ?? ide.currentTerminal) as any) || null;
+  const lines: string[] = ["[IDE_STATE]"];
+  if (typeof unchanged === "boolean") lines.push(`workspace_folders_unchanged=${unchanged}`);
+  if (folders.length) {
+    lines.push("workspace_folders:");
+    for (const f of folders.slice(0, 8)) {
+      const r = (asRecord(f) as any) || {};
+      const repoRoot = truncateInlineText(r.repository_root ?? r.repositoryRoot, 200);
+      const folderRoot = truncateInlineText(r.folder_root ?? r.folderRoot, 200);
+      if (!repoRoot && !folderRoot) continue;
+      lines.push(`- repository_root=${repoRoot || "(unknown)"} folder_root=${folderRoot || "(unknown)"}`);
+    }
+  }
+  if (term) {
+    const tid = Number(term.terminal_id ?? term.terminalId);
+    const cwd = truncateInlineText(term.current_working_directory ?? term.currentWorkingDirectory, 200);
+    if (Number.isFinite(tid) || cwd) lines.push(`current_terminal: id=${Number.isFinite(tid) ? String(tid) : "?"} cwd=${cwd || "(unknown)"}`);
+  }
+  if (lines.length === 1) return "";
+  lines.push("[/IDE_STATE]");
+  return lines.join("\n").trim();
+}
+
+function formatChatEditEventsForPrompt(v: unknown, { maxFiles = 6, maxEditsPerFile = 6 }: { maxFiles?: number; maxEditsPerFile?: number } = {}): string {
+  const node = (asRecord(v) as any) || {};
+  const events = Array.isArray(node.edit_events ?? node.editEvents) ? (node.edit_events ?? node.editEvents) : [];
+  const source = node.source;
+  const lines: string[] = ["[EDIT_EVENTS]"];
+  if (source != null) lines.push(`source=${String(source)}`);
+  for (const ev of events.slice(0, maxFiles)) {
+    const r = (asRecord(ev) as any) || {};
+    const p = truncateInlineText(r.path, 200) || "(unknown)";
+    const beforeBlob = truncateInlineText(r.before_blob_name ?? r.beforeBlobName, 120);
+    const afterBlob = truncateInlineText(r.after_blob_name ?? r.afterBlobName, 120);
+    const edits = Array.isArray(r.edits) ? r.edits : [];
+    lines.push(`- file: ${p} edits=${edits.length}${beforeBlob ? ` before=${beforeBlob}` : ""}${afterBlob ? ` after=${afterBlob}` : ""}`);
+    for (const ed of edits.slice(0, maxEditsPerFile)) {
+      const e = (asRecord(ed) as any) || {};
+      const afterStart = Number(e.after_line_start ?? e.afterLineStart);
+      const beforeStart = Number(e.before_line_start ?? e.beforeLineStart);
+      const afterStr = Number.isFinite(afterStart) ? String(afterStart) : "?";
+      const beforeStr = Number.isFinite(beforeStart) ? String(beforeStart) : "?";
+      const beforeText = truncateInlineText(e.before_text ?? e.beforeText, 200);
+      const afterText = truncateInlineText(e.after_text ?? e.afterText, 200);
+      lines.push(`  - edit: after_line_start=${afterStr} before_line_start=${beforeStr} before="${beforeText}" after="${afterText}"`);
+    }
+  }
+  if (lines.length === 1) return "";
+  lines.push("[/EDIT_EVENTS]");
+  return lines.join("\n").trim();
+}
+
+function formatCheckpointRefForPrompt(v: unknown): string {
+  const ref = (asRecord(v) as any) || {};
+  const requestId = truncateInlineText(ref.request_id ?? ref.requestId, 120);
+  const from = Number(ref.from_timestamp ?? ref.fromTimestamp);
+  const to = Number(ref.to_timestamp ?? ref.toTimestamp);
+  const src = ref.source;
+  const lines = ["[CHECKPOINT_REF]"];
+  if (requestId) lines.push(`request_id=${requestId}`);
+  if (Number.isFinite(from) || Number.isFinite(to)) lines.push(`from_timestamp=${Number.isFinite(from) ? String(from) : "?"} to_timestamp=${Number.isFinite(to) ? String(to) : "?"}`);
+  if (src != null) lines.push(`source=${String(src)}`);
+  if (lines.length === 1) return "";
+  lines.push("[/CHECKPOINT_REF]");
+  return lines.join("\n").trim();
+}
+
+function formatChangePersonalityForPrompt(v: unknown): string {
+  const p = (asRecord(v) as any) || {};
+  const t = personaTypeToLabel(p.personality_type ?? p.personalityType);
+  const custom = truncateInlineText(p.custom_instructions ?? p.customInstructions, 1000);
+  const lines = ["[CHANGE_PERSONALITY]", `personality_type=${t}`];
+  if (custom) lines.push(`custom_instructions=${custom}`);
+  lines.push("[/CHANGE_PERSONALITY]");
+  return lines.join("\n").trim();
+}
+
+function formatImageIdForPrompt(v: unknown): string {
+  const img = (asRecord(v) as any) || {};
+  const id = truncateInlineText(img.image_id ?? img.imageId, 200);
+  const fmt = img.format;
+  if (!id) return "";
+  return `[IMAGE_ID] image_id=${id} format=${fmt != null ? String(fmt) : "?"}`;
+}
+
+function formatFileIdForPrompt(v: unknown): string {
+  const f = (asRecord(v) as any) || {};
+  const id = truncateInlineText(f.file_id ?? f.fileId, 200);
+  const name = truncateInlineText(f.file_name ?? f.fileName, 200);
+  if (!id && !name) return "";
+  return `[FILE_ID] file_name=${name || "(unknown)"} file_id=${id || "(unknown)"}`;
+}
+
+function formatFileNodeForPrompt(v: unknown): string {
+  const f = (asRecord(v) as any) || {};
+  const raw = normalizeString(f.file_data ?? f.fileData);
+  const format = normalizeString(f.format) || "application/octet-stream";
+  if (!raw) return `[FILE] format=${format} (empty)`;
+  const b64 = raw.replace(/^data:.*?;base64,/, "");
+  const approxBytes = Math.max(0, Math.floor((b64.length * 3) / 4));
+  const isTextLike = format.startsWith("text/") || ["application/json", "application/xml", "application/yaml", "application/x-yaml", "application/markdown"].includes(format);
+  if (!isTextLike) return `[FILE] format=${format} bytes≈${approxBytes} (content omitted)`;
+  try {
+    const decoded = Buffer.from(b64, "base64").toString("utf8");
+    const max = 20_000;
+    const content = decoded.length > max ? decoded.slice(0, max) + "\n\n[Content truncated due to length...]" : decoded;
+    return `[FILE] format=${format} bytes≈${approxBytes}\n\n${content}`.trim();
+  } catch {
+    return `[FILE] format=${format} bytes≈${approxBytes} (decode failed)`;
+  }
+}
+
+function formatHistorySummaryForPrompt(v: unknown): string {
+  const h = (asRecord(v) as any) || {};
+  const summaryText = truncateInlineText(h.summary_text ?? h.summaryText, 3000);
+  const reqId = truncateInlineText(h.summarization_request_id ?? h.summarizationRequestId, 120);
+  const dropped = Number(h.history_beginning_dropped_num_exchanges ?? h.historyBeginningDroppedNumExchanges);
+  const abridged = truncateInlineText(h.history_middle_abridged_text ?? h.historyMiddleAbridgedText, 2000);
+  const end = Array.isArray(h.history_end ?? h.historyEnd) ? (h.history_end ?? h.historyEnd) : [];
+  const tmpl = truncateInlineText(h.message_template ?? h.messageTemplate, 400);
+  const lines: string[] = ["[HISTORY_SUMMARY]"];
+  if (reqId) lines.push(`summarization_request_id=${reqId}`);
+  if (Number.isFinite(dropped)) lines.push(`history_beginning_dropped_num_exchanges=${String(dropped)}`);
+  if (tmpl) lines.push(`message_template=${tmpl}`);
+  if (summaryText) lines.push(`summary_text=${summaryText}`);
+  if (abridged) lines.push(`history_middle_abridged_text=${abridged}`);
+  if (end.length) lines.push(`history_end_exchanges=${String(end.length)}`);
+  if (lines.length === 1) return "";
+  lines.push("[/HISTORY_SUMMARY]");
+  return lines.join("\n").trim();
+}
+
+function buildUserContentItemsFromTextAndNodes({ text, nodes }: { text: string; nodes: any[] }): UserContentItem[] {
+  const items: UserContentItem[] = [];
+  let lastText = "";
+  const pushText = (v: unknown) => {
+    const s = normalizeString(v);
+    if (!s || isUserPlaceholderMessage(s)) return;
+    if (normalizeString(lastText) === s) return;
+    items.push({ kind: "text", text: s });
+    lastText = s;
+  };
+  const pushImage = ({ data, format }: { data: unknown; format: unknown }) => {
+    const imageData = normalizeString(data);
+    if (!imageData) return;
+    items.push({ kind: "image", mimeType: mapImageFormatToMimeType(Number(format)), data: imageData });
+    lastText = "";
+  };
+
+  pushText(text);
+  for (const n of nodes) {
+    const r = (asRecord(n) as any) || {};
+    const t = Number(r.type);
+    if (t === 0) {
+      const tn = (asRecord(r.text_node ?? r.textNode) as any) || {};
+      pushText(tn.content);
+      continue;
+    }
+    if (t === 2) {
+      const img = (asRecord(r.image_node ?? r.imageNode) as any) || {};
+      pushImage({ data: img.image_data ?? img.imageData, format: img.format });
+      continue;
+    }
+    if (t === 3) {
+      const img = (asRecord(r.image_id_node ?? r.imageIdNode) as any) || {};
+      pushText(formatImageIdForPrompt(img));
+      continue;
+    }
+    if (t === 4) {
+      const ide = (asRecord(r.ide_state_node ?? r.ideStateNode) as any) || {};
+      pushText(formatIdeStateForPrompt(ide));
+      continue;
+    }
+    if (t === 5) {
+      const edits = (asRecord(r.edit_events_node ?? r.editEventsNode) as any) || {};
+      pushText(formatChatEditEventsForPrompt(edits));
+      continue;
+    }
+    if (t === 6) {
+      const ref = (asRecord(r.checkpoint_ref_node ?? r.checkpointRefNode) as any) || {};
+      pushText(formatCheckpointRefForPrompt(ref));
+      continue;
+    }
+    if (t === 7) {
+      const p = (asRecord(r.change_personality_node ?? r.changePersonalityNode) as any) || {};
+      pushText(formatChangePersonalityForPrompt(p));
+      continue;
+    }
+    if (t === 8) {
+      const f = (asRecord(r.file_node ?? r.fileNode) as any) || {};
+      pushText(formatFileNodeForPrompt(f));
+      continue;
+    }
+    if (t === 9) {
+      const f = (asRecord(r.file_id_node ?? r.fileIdNode) as any) || {};
+      pushText(formatFileIdForPrompt(f));
+      continue;
+    }
+    if (t === 10) {
+      const h = (asRecord(r.history_summary_node ?? r.historySummaryNode) as any) || {};
+      pushText(formatHistorySummaryForPrompt(h));
+      continue;
+    }
+  }
+  return items;
+}
+
+function toOpenAiUserContent(items: UserContentItem[]): string | any[] {
+  if (!items.length) return "";
+  const hasImage = items.some((x) => x.kind === "image");
+  if (!hasImage) return items.filter((x) => x.kind === "text").map((x: any) => x.text).filter(Boolean).join("\n\n").trim();
+  return items.map((x) =>
+    x.kind === "text"
+      ? { type: "text", text: x.text }
+      : { type: "image_url", image_url: { url: `data:${x.mimeType};base64,${x.data}` } }
+  );
+}
+
+function buildAnthropicUserContentBlocksFromTextAndNodes({ text, nodes, includeToolResults }: { text: string; nodes: any[]; includeToolResults: boolean }): any[] {
+  const blocks: any[] = [];
+  let lastText = "";
+  const pushText = (v: unknown) => {
+    const s = normalizeString(v);
+    if (!s || isUserPlaceholderMessage(s)) return;
+    if (normalizeString(lastText) === s) return;
+    blocks.push({ type: "text", text: s });
+    lastText = s;
+  };
+
+  pushText(text);
+  for (const n of nodes) {
+    const r = (asRecord(n) as any) || {};
+    const t = Number(r.type);
+    if (t === 0) {
+      const tn = (asRecord(r.text_node ?? r.textNode) as any) || {};
+      pushText(tn.content);
+      continue;
+    }
+    if (t === 1 && includeToolResults) {
+      const tr = (asRecord(r.tool_result_node ?? r.toolResultNode) as any) || {};
+      const toolUseId = normalizeString(tr.tool_use_id ?? tr.toolUseId);
+      if (!toolUseId) continue;
+      const items = parseChatRequestContentNodes(tr.content_nodes ?? tr.contentNodes);
+      const fallbackText = normalizeString(tr.content);
+      const contentBlocks: any[] = [];
+      for (const it of items) {
+        if (it.kind === "text") contentBlocks.push({ type: "text", text: it.text });
+        else contentBlocks.push({ type: "image", source: { type: "base64", media_type: it.mimeType, data: it.data } });
+      }
+      const content: any = contentBlocks.length ? contentBlocks : fallbackText;
+      blocks.push({ type: "tool_result", tool_use_id: toolUseId, content, is_error: normalizeIsErrorFlag(tr.is_error ?? tr.isError) });
+      lastText = "";
+      continue;
+    }
+    if (t === 2) {
+      const img = (asRecord(r.image_node ?? r.imageNode) as any) || {};
+      const data = normalizeString(img.image_data ?? img.imageData);
+      if (!data) continue;
+      blocks.push({ type: "image", source: { type: "base64", media_type: mapImageFormatToMimeType(Number(img.format)), data } });
+      lastText = "";
+      continue;
+    }
+    if (t === 3) {
+      const img = (asRecord(r.image_id_node ?? r.imageIdNode) as any) || {};
+      pushText(formatImageIdForPrompt(img));
+      continue;
+    }
+    if (t === 4) {
+      const ide = (asRecord(r.ide_state_node ?? r.ideStateNode) as any) || {};
+      pushText(formatIdeStateForPrompt(ide));
+      continue;
+    }
+    if (t === 5) {
+      const edits = (asRecord(r.edit_events_node ?? r.editEventsNode) as any) || {};
+      pushText(formatChatEditEventsForPrompt(edits));
+      continue;
+    }
+    if (t === 6) {
+      const ref = (asRecord(r.checkpoint_ref_node ?? r.checkpointRefNode) as any) || {};
+      pushText(formatCheckpointRefForPrompt(ref));
+      continue;
+    }
+    if (t === 7) {
+      const p = (asRecord(r.change_personality_node ?? r.changePersonalityNode) as any) || {};
+      pushText(formatChangePersonalityForPrompt(p));
+      continue;
+    }
+    if (t === 8) {
+      const f = (asRecord(r.file_node ?? r.fileNode) as any) || {};
+      pushText(formatFileNodeForPrompt(f));
+      continue;
+    }
+    if (t === 9) {
+      const f = (asRecord(r.file_id_node ?? r.fileIdNode) as any) || {};
+      pushText(formatFileIdForPrompt(f));
+      continue;
+    }
+    if (t === 10) {
+      const h = (asRecord(r.history_summary_node ?? r.historySummaryNode) as any) || {};
+      pushText(formatHistorySummaryForPrompt(h));
+    }
+  }
+  return blocks;
 }
 
 function buildOpenAiMessagesForToolCalling({
@@ -345,14 +710,14 @@ function buildOpenAiMessagesForToolCalling({
 }): any[] {
   const messages: any[] = [];
   if (system) messages.push({ role: "system", content: system });
-  for (const ex of chatHistory) {
-    const r = (asRecord(ex) as any) || {};
-    const userText = getExchangeUserText(r);
+  for (let i = 0; i < chatHistory.length; i++) {
+    const r = (asRecord(chatHistory[i]) as any) || {};
+    const userNodes = getExchangeRequestNodes(r);
+    const userContent = toOpenAiUserContent(buildUserContentItemsFromTextAndNodes({ text: getExchangeUserText(r), nodes: userNodes }));
+    if (Array.isArray(userContent) ? userContent.length : userContent) messages.push({ role: "user", content: userContent });
+
     const assistantText = getExchangeAssistantText(r);
     const toolUses = extractToolUsesFromOutputNodes(getExchangeOutputNodes(r));
-    const toolResults = extractToolResultsFromRequestNodes(getExchangeRequestNodes(r));
-
-    if (userText) messages.push({ role: "user", content: userText });
     if (toolUses.length) {
       messages.push({
         role: "assistant",
@@ -362,10 +727,30 @@ function buildOpenAiMessagesForToolCalling({
     } else if (assistantText) {
       messages.push({ role: "assistant", content: assistantText });
     }
-    for (const tr of toolResults) messages.push({ role: "tool", tool_call_id: tr.toolUseId, content: tr.content });
+
+    const next = i + 1 < chatHistory.length ? ((asRecord(chatHistory[i + 1]) as any) || {}) : null;
+    if (next) {
+      for (const tr of extractToolResultsFromRequestNodes(getExchangeRequestNodes(next))) {
+        messages.push({ role: "tool", tool_call_id: tr.toolUseId, content: tr.contentText });
+        const images = tr.contentItems.filter((x) => x.kind === "image");
+        if (images.length) {
+          const imageContent = toOpenAiUserContent([{ kind: "text", text: `[Tool Result Images] tool_use_id=${tr.toolUseId}` }, ...images]);
+          if (Array.isArray(imageContent) ? imageContent.length : imageContent) messages.push({ role: "user", content: imageContent });
+        }
+      }
+    }
   }
-  if (currentUserText) messages.push({ role: "user", content: currentUserText });
-  for (const tr of extractToolResultsFromRequestNodes(currentRequestNodes)) messages.push({ role: "tool", tool_call_id: tr.toolUseId, content: tr.content });
+
+  for (const tr of extractToolResultsFromRequestNodes(currentRequestNodes)) {
+    messages.push({ role: "tool", tool_call_id: tr.toolUseId, content: tr.contentText });
+    const images = tr.contentItems.filter((x) => x.kind === "image");
+    if (images.length) {
+      const imageContent = toOpenAiUserContent([{ kind: "text", text: `[Tool Result Images] tool_use_id=${tr.toolUseId}` }, ...images]);
+      if (Array.isArray(imageContent) ? imageContent.length : imageContent) messages.push({ role: "user", content: imageContent });
+    }
+  }
+  const currentContent = toOpenAiUserContent(buildUserContentItemsFromTextAndNodes({ text: currentUserText, nodes: currentRequestNodes }));
+  if (Array.isArray(currentContent) ? currentContent.length : currentContent) messages.push({ role: "user", content: currentContent });
   return messages;
 }
 
@@ -390,11 +775,8 @@ function buildAnthropicMessagesForToolCalling({
   currentRequestNodes: any[];
 }): any[] {
   const messages: any[] = [];
-  const pushUser = ({ text, toolResults }: { text: string; toolResults: ToolResultLike[] }) => {
-    const blocks: any[] = [];
-    if (text) blocks.push({ type: "text", text });
-    for (const tr of toolResults) blocks.push({ type: "tool_result", tool_use_id: tr.toolUseId, content: tr.content, is_error: tr.isError });
-    if (blocks.length === 0) return;
+  const pushUserBlocks = (blocks: any[]) => {
+    if (!blocks.length) return;
     messages.push({ role: "user", content: blocks.length === 1 && blocks[0].type === "text" ? blocks[0].text : blocks });
   };
   const pushAssistant = ({ text, toolUses }: { text: string; toolUses: ToolUseLike[] }) => {
@@ -407,12 +789,31 @@ function buildAnthropicMessagesForToolCalling({
     for (const tu of toolUses) blocks.push({ type: "tool_use", id: tu.toolUseId, name: tu.toolName, input: parseJsonObjectOrThrow({ label: `Tool(${tu.toolName}) input_json`, json: tu.inputJson }) });
     messages.push({ role: "assistant", content: blocks });
   };
-  for (const ex of chatHistory) {
-    const r = (asRecord(ex) as any) || {};
-    pushUser({ text: getExchangeUserText(r), toolResults: extractToolResultsFromRequestNodes(getExchangeRequestNodes(r)) });
+
+  for (let i = 0; i < chatHistory.length; i++) {
+    const r = (asRecord(chatHistory[i]) as any) || {};
+    pushUserBlocks(buildAnthropicUserContentBlocksFromTextAndNodes({ text: getExchangeUserText(r), nodes: getExchangeRequestNodes(r), includeToolResults: false }));
     pushAssistant({ text: getExchangeAssistantText(r), toolUses: extractToolUsesFromOutputNodes(getExchangeOutputNodes(r)) });
+
+    const next = i + 1 < chatHistory.length ? ((asRecord(chatHistory[i + 1]) as any) || {}) : null;
+    if (next) {
+      const toolResults = extractToolResultsFromRequestNodes(getExchangeRequestNodes(next));
+      if (toolResults.length) {
+        pushUserBlocks(
+          toolResults.map((tr) => {
+            const contentBlocks: any[] = [];
+            for (const it of tr.contentItems) {
+              if (it.kind === "text") contentBlocks.push({ type: "text", text: it.text });
+              else contentBlocks.push({ type: "image", source: { type: "base64", media_type: it.mimeType, data: it.data } });
+            }
+            return { type: "tool_result", tool_use_id: tr.toolUseId, content: contentBlocks.length ? contentBlocks : tr.contentText, is_error: tr.isError };
+          })
+        );
+      }
+    }
   }
-  pushUser({ text: currentUserText, toolResults: extractToolResultsFromRequestNodes(currentRequestNodes) });
+
+  pushUserBlocks(buildAnthropicUserContentBlocksFromTextAndNodes({ text: currentUserText, nodes: currentRequestNodes, includeToolResults: true }));
   return messages;
 }
 
@@ -423,7 +824,9 @@ function getToolDefinitions(body: Record<string, any>): any[] {
 
 function parseToolInputSchema(toolDef: any): Record<string, any> {
   const name = normalizeString(toolDef?.name);
-  const raw = normalizeString(toolDef?.input_schema_json);
+  const direct = toolDef?.input_schema ?? toolDef?.inputSchema;
+  if (direct && typeof direct === "object" && !Array.isArray(direct)) return direct as Record<string, any>;
+  const raw = normalizeString(toolDef?.input_schema_json ?? toolDef?.inputSchemaJson);
   if (!raw) return { type: "object", properties: {} };
   try {
     const parsed = JSON.parse(raw);
@@ -445,12 +848,79 @@ function toAnthropicTools(toolDefs: any[]): AnthropicTool[] {
   return toolDefs.map((d) => ({ name: normalizeString(d.name), description: normalizeString(d.description) || undefined, input_schema: parseToolInputSchema(d) }));
 }
 
-function toolUseNode({ id, toolUseId, toolName, inputJson }: { id: number; toolUseId: string; toolName: string; inputJson: string }): any {
-  return { id, type: 5, tool_use: { tool_use_id: toolUseId, tool_name: toolName, input_json: inputJson } };
+function toolUseNode({
+  id,
+  toolUseId,
+  toolName,
+  inputJson,
+  mcpServerName,
+  mcpToolName
+}: {
+  id: number;
+  toolUseId: string;
+  toolName: string;
+  inputJson: string;
+  mcpServerName?: string;
+  mcpToolName?: string;
+}): any {
+  const tool_use: any = { tool_use_id: toolUseId, tool_name: toolName, input_json: inputJson };
+  if (mcpServerName) tool_use.mcp_server_name = mcpServerName;
+  if (mcpToolName) tool_use.mcp_tool_name = mcpToolName;
+  return { id, type: 5, content: "", tool_use };
+}
+
+function toolUseStartNode({
+  id,
+  toolUseId,
+  toolName,
+  inputJson,
+  mcpServerName,
+  mcpToolName
+}: {
+  id: number;
+  toolUseId: string;
+  toolName: string;
+  inputJson: string;
+  mcpServerName?: string;
+  mcpToolName?: string;
+}): any {
+  const tool_use: any = { tool_use_id: toolUseId, tool_name: toolName, input_json: inputJson };
+  if (mcpServerName) tool_use.mcp_server_name = mcpServerName;
+  if (mcpToolName) tool_use.mcp_tool_name = mcpToolName;
+  return { id, type: 7, content: "", tool_use };
+}
+
+function rawResponseNode({ id, content }: { id: number; content: string }): any {
+  return { id, type: 0, content };
+}
+
+function mainTextFinishedNode({ id, content }: { id: number; content: string }): any {
+  return { id, type: 2, content };
+}
+
+function tokenUsageNode({
+  id,
+  inputTokens,
+  outputTokens,
+  cacheReadInputTokens,
+  cacheCreationInputTokens
+}: {
+  id: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}): any {
+  const token_usage: any = {};
+  if (typeof inputTokens === "number") token_usage.input_tokens = inputTokens;
+  if (typeof outputTokens === "number") token_usage.output_tokens = outputTokens;
+  if (typeof cacheReadInputTokens === "number") token_usage.cache_read_input_tokens = cacheReadInputTokens;
+  if (typeof cacheCreationInputTokens === "number") token_usage.cache_creation_input_tokens = cacheCreationInputTokens;
+  return { id, type: 10, content: "", token_usage };
 }
 
 function thinkingNode({ id, summary }: { id: number; summary: string }): any {
-  return { id, type: 8, thinking: { summary } };
+  return { id, type: 8, content: "", thinking: { summary } };
 }
 
 async function completeText({
@@ -522,13 +992,6 @@ async function completeText({
       timeoutMs,
       abortSignal
     });
-  }
-
-  if (provider.type === "gemini_cli") {
-    const command = normalizeString(provider.command);
-    if (!command) throw new Error(`Provider(${provider.id}) gemini_cli command 未配置`);
-    const prompt = system ? `${system}\n\n${user}` : user;
-    return await geminiCliCompleteText({ command, args: provider.args, model: m, prompt, apiKey: apiKey || undefined, timeoutMs, abortSignal });
   }
 
   throw new Error(`未知 Provider type: ${String((provider as any).type)}`);
@@ -605,14 +1068,6 @@ async function* streamText({
       timeoutMs,
       abortSignal
     });
-    return;
-  }
-
-  if (provider.type === "gemini_cli") {
-    const command = normalizeString(provider.command);
-    if (!command) throw new Error(`Provider(${provider.id}) gemini_cli command 未配置`);
-    const prompt = system ? `${system}\n\n${user}` : user;
-    yield* geminiCliStreamEvents({ command, args: provider.args, model: m, prompt, apiKey: apiKey || undefined, timeoutMs, abortSignal });
     return;
   }
 
@@ -742,8 +1197,8 @@ export async function maybeHandleCallApi({
       suggested_prefix_char_count: 0,
       suggested_suffix_char_count: 0
     }));
-    const feature_flags = {
-      ...upstreamFlags,
+    const featureFlagsMode = normalizeString((cfg.proxy as any)?.featureFlagsMode) === "passthrough" ? "passthrough" : "safe";
+    const byokFeatureFlags = {
       additional_chat_models: registryJson,
       additionalChatModels: registryJson,
       agent_chat_model: agentChatModel,
@@ -754,6 +1209,10 @@ export async function maybeHandleCallApi({
       modelRegistry: registryJson,
       model_info_registry: infoRegistryJson,
       modelInfoRegistry: infoRegistryJson,
+      show_thinking_summary: true,
+      showThinkingSummary: true
+    };
+    const safeDisabledFlags = {
       enable_grpc_to_ide_messaging: false,
       enableGrpcToIdeMessaging: false,
       enable_commit_session_events: false,
@@ -771,8 +1230,11 @@ export async function maybeHandleCallApi({
       enable_credits_in_settings: false,
       enableCreditsInSettings: false,
       enable_credit_banner_in_settings: false,
-      enableCreditBannerInSettings: false
+      enableCreditBannerInSettings: false,
+      enable_completion_file_edit_events: false,
+      enableCompletionFileEditEvents: false
     };
+    const feature_flags = featureFlagsMode === "passthrough" ? { ...upstreamFlags, ...byokFeatureFlags } : { ...upstreamFlags, ...byokFeatureFlags, ...safeDisabledFlags };
     const base = upstream && typeof upstream === "object" ? upstream : { default_model: "", feature_flags: {}, languages: [], models: [], user: {}, user_tier: "unknown" };
     return transform({ ...base, default_model: agentChatModel, models, feature_flags });
   }
@@ -909,25 +1371,6 @@ export async function maybeHandleCallApiStream({
 
   if (ep === "chat-stream") {
     const toolDefs = getToolDefinitions(request);
-    if (!toolDefs.length) {
-      async function* gen() {
-        let nodeId = 1;
-        for await (const chunk of streamText({ provider: resolvedProvider, model: resolvedModel, system, user, timeoutMs: tmo, abortSignal })) {
-          throwIfAborted(abortSignal);
-          if (chunk.kind === "text") {
-            yield transform({ text: chunk.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
-            continue;
-          }
-          if (chunk.kind === "thinking") {
-            yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: chunk.summary })] });
-            continue;
-          }
-          throw new Error("chat-stream 未提供 tool_definitions 但收到了 tool_use");
-        }
-      }
-      return gen();
-    }
-
     const chatHistory = getChatHistory(request);
     const requestNodes = getRequestNodes(request);
 
@@ -935,15 +1378,27 @@ export async function maybeHandleCallApiStream({
     const model = resolvedModel;
     if (!model) throw new Error(`Provider(${provider.id}) 缺少 model`);
 
-    async function* genTools() {
-      let nodeId = 1;
+	    async function* gen() {
+	      let nodeId = 1;
+	      let sawToolUse = false;
+	      let fullText = "";
+	      const mcpMetaByToolName = new Map<string, { mcpServerName?: string; mcpToolName?: string }>();
+	      for (const d of toolDefs) {
+	        const r = (asRecord(d) as any) || {};
+	        const name = normalizeString(r.name);
+	        if (!name) continue;
+	        const mcpServerName = normalizeString(r.mcp_server_name ?? r.mcpServerName);
+	        const mcpToolName = normalizeString(r.mcp_tool_name ?? r.mcpToolName);
+	        if (mcpServerName || mcpToolName) mcpMetaByToolName.set(name, { mcpServerName: mcpServerName || undefined, mcpToolName: mcpToolName || undefined });
+	      }
+	      const getToolMeta = (toolName: string): { mcpServerName?: string; mcpToolName?: string } => mcpMetaByToolName.get(toolName) || {};
 
-      if (provider.type === "openai_compatible") {
-        const baseUrl = normalizeString(provider.baseUrl);
-        if (!baseUrl) throw new Error(`Provider(${provider.id}) 缺少 baseUrl`);
-        const apiKey = normalizeString(provider.secrets.apiKey || provider.secrets.token || "");
+	      if (provider.type === "openai_compatible") {
+	        const baseUrl = normalizeString(provider.baseUrl);
+	        if (!baseUrl) throw new Error(`Provider(${provider.id}) 缺少 baseUrl`);
+	        const apiKey = normalizeString(provider.secrets.apiKey || provider.secrets.token || "");
         if (!apiKey) throw new Error(`Provider(${provider.id}) 缺少 apiKey/token`);
-        const tools = toOpenAiTools(toolDefs);
+        const tools = toolDefs.length ? toOpenAiTools(toolDefs) : undefined;
         const messages = buildOpenAiMessagesForToolCalling({ system, chatHistory, currentUserText: user, currentRequestNodes: requestNodes });
         throwIfAborted(abortSignal);
         for await (const ev of openAiChatStreamEvents({
@@ -956,33 +1411,58 @@ export async function maybeHandleCallApiStream({
           extraBody: provider.requestDefaults,
           timeoutMs: tmo,
           abortSignal
-        })) {
-          throwIfAborted(abortSignal);
-          if (ev.kind === "text") {
-            yield transform({ text: ev.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
-            continue;
-          }
-          if (ev.kind === "thinking") {
-            yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: ev.summary })] });
-            continue;
-          }
-          yield transform({
-            text: "",
-            unknown_blob_names: [],
-            checkpoint_not_found: false,
-            workspace_file_chunks: [],
-            nodes: [toolUseNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName: ev.toolName, inputJson: ev.inputJson })]
-          });
-        }
-        return;
-      }
+	        })) {
+	          throwIfAborted(abortSignal);
+	          if (ev.kind === "text") {
+	            fullText += ev.text;
+	            yield transform({ text: ev.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [rawResponseNode({ id: nodeId++, content: ev.text })] });
+	            continue;
+	          }
+	          if (ev.kind === "thinking") {
+	            yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: ev.summary })] });
+	            continue;
+	          }
+	          if (ev.kind === "token_usage") {
+	            yield transform({
+	              text: "",
+	              unknown_blob_names: [],
+	              checkpoint_not_found: false,
+	              workspace_file_chunks: [],
+	              nodes: [tokenUsageNode({ id: nodeId++, inputTokens: ev.inputTokens, outputTokens: ev.outputTokens, cacheReadInputTokens: ev.cacheReadInputTokens, cacheCreationInputTokens: ev.cacheCreationInputTokens })]
+	            });
+	            continue;
+	          }
+	          if (!toolDefs.length) throw new Error("chat-stream 未提供 tool_definitions 但收到了 tool_use");
+	          const toolName = normalizeString(ev.toolName);
+	          const meta = getToolMeta(toolName);
+	          sawToolUse = true;
+	          yield transform({
+	            text: "",
+	            unknown_blob_names: [],
+	            checkpoint_not_found: false,
+	            workspace_file_chunks: [],
+	            nodes: [toolUseStartNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName, inputJson: ev.inputJson, ...meta })]
+	          });
+	          yield transform({
+	            text: "",
+	            unknown_blob_names: [],
+	            checkpoint_not_found: false,
+	            workspace_file_chunks: [],
+	            nodes: [toolUseNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName, inputJson: ev.inputJson, ...meta })]
+	          });
+	        }
+	        const finalNodes: any[] = [];
+	        if (fullText) finalNodes.push(mainTextFinishedNode({ id: nodeId++, content: fullText }));
+	        yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: finalNodes, stop_reason: sawToolUse ? 3 : 1 });
+	        return;
+	      }
 
       if (provider.type === "openai_native") {
         const baseUrl = normalizeString(provider.baseUrl);
         if (!baseUrl) throw new Error(`Provider(${provider.id}) 缺少 baseUrl`);
         const apiKey = normalizeString(provider.secrets.apiKey || provider.secrets.token || "");
         if (!apiKey) throw new Error(`Provider(${provider.id}) 缺少 apiKey/token`);
-        const tools = toOpenAiTools(toolDefs);
+        const tools = toolDefs.length ? toOpenAiTools(toolDefs) : [];
         const messages = buildOpenAiMessagesForToolCalling({ system, chatHistory, currentUserText: user, currentRequestNodes: requestNodes });
         throwIfAborted(abortSignal);
         for await (const ev of codexChatStreamEventsWithTools({
@@ -995,29 +1475,54 @@ export async function maybeHandleCallApiStream({
           extraBody: provider.requestDefaults,
           timeoutMs: tmo,
           abortSignal
-        })) {
-          throwIfAborted(abortSignal);
-          if (ev.kind === "text") {
-            yield transform({ text: ev.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
-            continue;
-          }
-          if (ev.kind === "thinking") {
-            yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: ev.summary })] });
-            continue;
-          }
-          yield transform({
-            text: "",
-            unknown_blob_names: [],
-            checkpoint_not_found: false,
-            workspace_file_chunks: [],
-            nodes: [toolUseNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName: ev.toolName, inputJson: ev.inputJson })]
-          });
-        }
-        return;
-      }
+	        })) {
+	          throwIfAborted(abortSignal);
+	          if (ev.kind === "text") {
+	            fullText += ev.text;
+	            yield transform({ text: ev.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [rawResponseNode({ id: nodeId++, content: ev.text })] });
+	            continue;
+	          }
+	          if (ev.kind === "thinking") {
+	            yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: ev.summary })] });
+	            continue;
+	          }
+	          if (ev.kind === "token_usage") {
+	            yield transform({
+	              text: "",
+	              unknown_blob_names: [],
+	              checkpoint_not_found: false,
+	              workspace_file_chunks: [],
+	              nodes: [tokenUsageNode({ id: nodeId++, inputTokens: ev.inputTokens, outputTokens: ev.outputTokens, cacheReadInputTokens: ev.cacheReadInputTokens, cacheCreationInputTokens: ev.cacheCreationInputTokens })]
+	            });
+	            continue;
+	          }
+	          if (!toolDefs.length) throw new Error("chat-stream 未提供 tool_definitions 但收到了 tool_use");
+	          const toolName = normalizeString(ev.toolName);
+	          const meta = getToolMeta(toolName);
+	          sawToolUse = true;
+	          yield transform({
+	            text: "",
+	            unknown_blob_names: [],
+	            checkpoint_not_found: false,
+	            workspace_file_chunks: [],
+	            nodes: [toolUseStartNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName, inputJson: ev.inputJson, ...meta })]
+	          });
+	          yield transform({
+	            text: "",
+	            unknown_blob_names: [],
+	            checkpoint_not_found: false,
+	            workspace_file_chunks: [],
+	            nodes: [toolUseNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName, inputJson: ev.inputJson, ...meta })]
+	          });
+	        }
+	        const finalNodes: any[] = [];
+	        if (fullText) finalNodes.push(mainTextFinishedNode({ id: nodeId++, content: fullText }));
+	        yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: finalNodes, stop_reason: sawToolUse ? 3 : 1 });
+	        return;
+	      }
 
       if (provider.type === "anthropic_native") {
-        const tools = toAnthropicTools(toolDefs);
+        const tools = toolDefs.length ? toAnthropicTools(toolDefs) : undefined;
         const maxTokens = 1024;
         const messages = buildAnthropicMessagesForToolCalling({ chatHistory, currentUserText: user, currentRequestNodes: requestNodes });
         throwIfAborted(abortSignal);
@@ -1037,31 +1542,54 @@ export async function maybeHandleCallApiStream({
           extraBody: provider.requestDefaults,
           timeoutMs: tmo,
           abortSignal
-        })) {
-          throwIfAborted(abortSignal);
-          if (ev.kind === "text") {
-            yield transform({ text: ev.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] });
-            continue;
-          }
-          if (ev.kind === "thinking") {
-            yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: ev.summary })] });
-            continue;
-          }
-          yield transform({
-            text: "",
-            unknown_blob_names: [],
-            checkpoint_not_found: false,
-            workspace_file_chunks: [],
-            nodes: [toolUseNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName: ev.toolName, inputJson: ev.inputJson })]
-          });
-        }
-        return;
-      }
-
-      if (provider.type === "gemini_cli") throw new Error("gemini_cli 不支持 tool_definitions/chat-stream tools");
+	        })) {
+	          throwIfAborted(abortSignal);
+	          if (ev.kind === "text") {
+	            fullText += ev.text;
+	            yield transform({ text: ev.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [rawResponseNode({ id: nodeId++, content: ev.text })] });
+	            continue;
+	          }
+	          if (ev.kind === "thinking") {
+	            yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: ev.summary })] });
+	            continue;
+	          }
+	          if (ev.kind === "token_usage") {
+	            yield transform({
+	              text: "",
+	              unknown_blob_names: [],
+	              checkpoint_not_found: false,
+	              workspace_file_chunks: [],
+	              nodes: [tokenUsageNode({ id: nodeId++, inputTokens: ev.inputTokens, outputTokens: ev.outputTokens, cacheReadInputTokens: ev.cacheReadInputTokens, cacheCreationInputTokens: ev.cacheCreationInputTokens })]
+	            });
+	            continue;
+	          }
+	          if (!toolDefs.length) throw new Error("chat-stream 未提供 tool_definitions 但收到了 tool_use");
+	          const toolName = normalizeString(ev.toolName);
+	          const meta = getToolMeta(toolName);
+	          sawToolUse = true;
+	          yield transform({
+	            text: "",
+	            unknown_blob_names: [],
+	            checkpoint_not_found: false,
+	            workspace_file_chunks: [],
+	            nodes: [toolUseStartNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName, inputJson: ev.inputJson, ...meta })]
+	          });
+	          yield transform({
+	            text: "",
+	            unknown_blob_names: [],
+	            checkpoint_not_found: false,
+	            workspace_file_chunks: [],
+	            nodes: [toolUseNode({ id: nodeId++, toolUseId: ev.toolUseId, toolName, inputJson: ev.inputJson, ...meta })]
+	          });
+	        }
+	        const finalNodes: any[] = [];
+	        if (fullText) finalNodes.push(mainTextFinishedNode({ id: nodeId++, content: fullText }));
+	        yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: finalNodes, stop_reason: sawToolUse ? 3 : 1 });
+	        return;
+	      }
       throw new Error(`未知 Provider type: ${String((provider as any).type)}`);
     }
-    return genTools();
+    return gen();
   }
 
   if (
@@ -1075,15 +1603,16 @@ export async function maybeHandleCallApiStream({
       let nodeId = 1;
       for await (const chunk of streamText({ provider: resolvedProvider, model: resolvedModel, system, user, timeoutMs: tmo, abortSignal })) {
         throwIfAborted(abortSignal);
-        if (chunk.kind === "thinking") {
-          if (ep === "instruction-stream" || ep === "smart-paste-stream") continue;
-          yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: chunk.summary })] });
-          continue;
-        }
-        if (chunk.kind === "tool_use") throw new Error(`${ep} 不支持 tool_use`);
-        const raw = ep === "instruction-stream" || ep === "smart-paste-stream" ? { text: chunk.text } : { text: chunk.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] };
-        yield transform(raw);
-      }
+	        if (chunk.kind === "thinking") {
+	          if (ep === "instruction-stream" || ep === "smart-paste-stream") continue;
+	          yield transform({ text: "", unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [thinkingNode({ id: nodeId++, summary: chunk.summary })] });
+	          continue;
+	        }
+	        if (chunk.kind === "token_usage") continue;
+	        if (chunk.kind === "tool_use") throw new Error(`${ep} 不支持 tool_use`);
+	        const raw = ep === "instruction-stream" || ep === "smart-paste-stream" ? { text: chunk.text } : { text: chunk.text, unknown_blob_names: [], checkpoint_not_found: false, workspace_file_chunks: [], nodes: [] };
+	        yield transform(raw);
+	      }
     }
     return gen();
   }

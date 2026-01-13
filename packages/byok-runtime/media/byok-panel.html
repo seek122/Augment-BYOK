@@ -409,6 +409,14 @@
             </div>
             <span class="text-muted text-xs">Token 安全存储于 VS Code Secrets，不会明文回显。</span>
           </div>
+          <div class="form-group">
+            <label class="form-label" for="select-feature-flags-mode">Feature Flags Mode（Advanced）</label>
+            <select id="select-feature-flags-mode">
+              <option value="safe">safe（默认：为兼容不完整 relay，禁用 Remote Agents/Notifications/Native MCP 等）</option>
+              <option value="passthrough">passthrough（保留 upstream feature_flags：需要 relay/官方 upstream 覆盖完整端点）</option>
+            </select>
+            <div id="text-feature-flags-mode-warning" class="text-muted text-xs hidden">passthrough 仅适用于“完整 relay 覆盖”或直连官方 upstream；若 relay 不支持 `/remote-agents/*`、`/notifications/*`、`/agents/*` 等端点，可能导致 Services/设置页异常或持续 404。</div>
+          </div>
         </div>
       </div>
     </section>
@@ -436,7 +444,6 @@
                 <option value="openaiCompatible">OpenAI Compatible (通用)</option>
                 <option value="anthropic">Anthropic (Claude)</option>
                 <option value="codex">OpenAI (Codex)</option>
-                <option value="geminiCli">Gemini CLI</option>
               </select>
             </div>
             <div class="form-group form-grid--full flex-end">

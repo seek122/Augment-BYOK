@@ -4,15 +4,14 @@ export type InstallArgs = {
   setActivate: (next: unknown) => void;
 };
 
-export type ByokProviderType = "openai_compatible" | "openai_native" | "anthropic_native" | "gemini_cli";
+export type ByokProviderType = "openai_compatible" | "openai_native" | "anthropic_native";
+export type ByokFeatureFlagsMode = "safe" | "passthrough";
 
 export type ByokProvider = {
   id: string;
   type: ByokProviderType;
   baseUrl: string;
   defaultModel?: string;
-  command?: string;
-  args?: string[];
   headers?: Record<string, string>;
   requestDefaults?: Record<string, any>;
 };
@@ -31,7 +30,7 @@ export type ByokRoutingV2 = {
 export type ByokConfigV2 = {
   version: 2;
   enabled?: boolean;
-  proxy?: { baseUrl: string };
+  proxy?: { baseUrl: string; featureFlagsMode?: ByokFeatureFlagsMode };
   providers: ByokProvider[];
   routing: ByokRoutingV2;
 };
@@ -45,7 +44,7 @@ export type ByokResolvedProvider = ByokProvider & { secrets: ByokProviderSecrets
 
 export type ByokResolvedConfigV2 = Omit<ByokConfigV2, "providers" | "proxy"> & {
   providers: ByokResolvedProvider[];
-  proxy: { baseUrl: string; token?: string };
+  proxy: { baseUrl: string; token?: string; featureFlagsMode?: ByokFeatureFlagsMode };
 };
 
 export type ByokExportV2 = {

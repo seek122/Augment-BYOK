@@ -55,6 +55,9 @@
     cfg.enabled = Boolean(el("check-plugin-enabled")?.checked);
     cfg.proxy = cfg.proxy || { baseUrl: "" };
     cfg.proxy.baseUrl = normalizeString(el("input-augment-base-url")?.value);
+    const featureFlagsMode = normalizeString(el("select-feature-flags-mode")?.value);
+    if (featureFlagsMode === "passthrough") cfg.proxy.featureFlagsMode = "passthrough";
+    else delete cfg.proxy.featureFlagsMode;
     cfg.routing = cfg.routing || { activeProviderId: "", rules: {} };
     cfg.routing.activeProviderId = normalizeString(el("select-active-provider")?.value);
     return cfg;
@@ -99,7 +102,6 @@
     for (const p of providers) {
       const pid = String(p.id || "");
       const kind = String(p.type || "");
-      const isCli = kind === "gemini_cli";
       const sec = (state.secretStatus?.providers && state.secretStatus.providers[pid]) || {};
 
       const card = document.createElement("div");
@@ -178,43 +180,13 @@
       inputBase.placeholder =
         kind === "anthropic_native"
           ? "例如: https://api.anthropic.com/v1"
-          : isCli
-            ? "例如: https://generativelanguage.googleapis.com/v1（用于 models list，可留空）"
-            : kind === "openai_native"
-              ? "例如: https://api.openai.com/codex/v1"
-              : "例如: https://api.openai.com/v1";
+          : kind === "openai_native"
+            ? "例如: https://api.openai.com/codex/v1"
+            : "例如: https://api.openai.com/v1";
       inputBase.addEventListener("input", () => {
         p.baseUrl = normalizeString(inputBase.value);
       });
       g1.appendChild(inputBase);
-
-      const gCmd = document.createElement("div");
-      gCmd.className = "form-group";
-      gCmd.innerHTML = "<label class='form-label'>Command (gemini_cli)</label>";
-      const inputCmd = document.createElement("input");
-      inputCmd.type = "text";
-      inputCmd.value = normalizeString(p.command);
-      inputCmd.placeholder = "例如: gemini";
-      inputCmd.addEventListener("input", () => {
-        p.command = normalizeString(inputCmd.value);
-      });
-      gCmd.appendChild(inputCmd);
-
-      const gArgs = document.createElement("div");
-      gArgs.className = "form-group form-grid--full";
-      gArgs.innerHTML = "<label class='form-label'>Args（每行一个，支持 {{model}}/{{prompt}}）</label>";
-      const inputArgs = document.createElement("textarea");
-      inputArgs.rows = 3;
-      inputArgs.value = Array.isArray(p.args) ? p.args.map((x) => normalizeString(x)).filter(Boolean).join("\n") : "";
-      inputArgs.placeholder = "--model\n{{model}}\n--prompt\n{{prompt}}";
-      inputArgs.addEventListener("input", () => {
-        const args = inputArgs.value
-          .split("\n")
-          .map((x) => normalizeString(x))
-          .filter(Boolean);
-        p.args = args.length ? args : undefined;
-      });
-      gArgs.appendChild(inputArgs);
 
       const g2 = document.createElement("div");
       g2.className = "form-group";
@@ -230,7 +202,7 @@
       const inputModel = document.createElement("input");
       inputModel.type = "text";
       inputModel.value = currentModel;
-      inputModel.placeholder = isCli ? "例如: gemini-1.5-pro" : "例如: gpt-4o-mini";
+      inputModel.placeholder = kind === "anthropic_native" ? "例如: claude-sonnet-4-20250514" : "例如: gpt-4o-mini";
       inputModel.addEventListener("input", () => {
         const v = normalizeString(inputModel.value);
         p.defaultModel = v || undefined;
@@ -296,10 +268,6 @@
       });
 
       grid.appendChild(g1);
-      if (isCli) {
-        grid.appendChild(gCmd);
-        grid.appendChild(gArgs);
-      }
       grid.appendChild(g2);
       grid.appendChild(g3);
 
@@ -562,6 +530,9 @@
     if (!state.config) return;
     el("check-plugin-enabled").checked = Boolean(state.config.enabled);
     el("input-augment-base-url").value = normalizeString(state.config.proxy && state.config.proxy.baseUrl);
+    const featureFlagsMode = normalizeString(state.config.proxy && state.config.proxy.featureFlagsMode);
+    el("select-feature-flags-mode").value = featureFlagsMode === "passthrough" ? "passthrough" : "safe";
+    el("text-feature-flags-mode-warning").classList.toggle("hidden", el("select-feature-flags-mode").value !== "passthrough");
     renderEffectiveUrl();
     renderProviderCards();
     renderRouting();
@@ -625,6 +596,7 @@
   });
 
   el("input-augment-base-url").addEventListener("input", () => renderEffectiveUrl());
+  el("select-feature-flags-mode").addEventListener("change", () => el("text-feature-flags-mode-warning").classList.toggle("hidden", el("select-feature-flags-mode").value !== "passthrough"));
 
   el("btn-clear-augment-token").addEventListener("click", () => {
     el("input-augment-token").value = "";
@@ -652,8 +624,8 @@
     if (!id) return toast("Provider ID 不能为空");
     const providers = Array.isArray(state.config?.providers) ? state.config.providers : [];
     if (providers.some((p) => String(p.id || "") === id)) return toast("Provider ID 已存在");
-    const type = kind === "anthropic" ? "anthropic_native" : kind === "codex" ? "openai_native" : kind === "geminiCli" ? "gemini_cli" : "openai_compatible";
-    providers.push(type === "gemini_cli" ? { id, type, baseUrl: "", defaultModel: "", command: "gemini", args: ["--model", "{{model}}", "--prompt", "{{prompt}}"] } : { id, type, baseUrl: "", defaultModel: "" });
+    const type = kind === "anthropic" ? "anthropic_native" : kind === "codex" ? "openai_native" : "openai_compatible";
+    providers.push({ id, type, baseUrl: "", defaultModel: "" });
     state.config.providers = providers;
     el("input-new-provider-id").value = "";
     el("region-add-provider").classList.add("hidden");

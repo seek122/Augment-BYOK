@@ -4,13 +4,6 @@ import { asRecord } from "../../atom/common/object";
 import { assertVscodeContextStorage } from "../../atom/common/vscode-storage";
 import type { ByokConfigV2, ByokExportV2, ByokProvider, ByokProviderSecrets, ByokResolvedConfigV2, ByokRoutingRule } from "../../types";
 
-function normalizeStringArray(v: unknown): string[] | undefined {
-  const arr = Array.isArray(v) ? v : null;
-  if (!arr) return undefined;
-  const out = arr.map(normalizeString).filter(Boolean);
-  return out.length ? out : undefined;
-}
-
 function normalizeStringRecord(v: unknown): Record<string, string> | undefined {
   const r = asRecord(v);
   if (!r) return undefined;
@@ -31,14 +24,12 @@ function normalizeProvider(v: unknown): ByokProvider | null {
   const type = normalizeString(r.type);
   const baseUrl = normalizeString(r.baseUrl);
   const defaultModel = normalizeString(r.defaultModel) || undefined;
-  const command = normalizeString(r.command) || undefined;
-  const args = normalizeStringArray(r.args);
   const headers = normalizeStringRecord(r.headers);
   const requestDefaults = (asRecord(r.requestDefaults) as any) || undefined;
   if (!id) return null;
-  if (type !== "openai_compatible" && type !== "openai_native" && type !== "anthropic_native" && type !== "gemini_cli") return null;
-  if (type !== "gemini_cli" && !baseUrl) return null;
-  return { id, type, baseUrl, defaultModel, command, args, headers, requestDefaults };
+  if (type !== "openai_compatible" && type !== "openai_native" && type !== "anthropic_native") return null;
+  if (!baseUrl) return null;
+  return { id, type, baseUrl, defaultModel, headers, requestDefaults };
 }
 
 function normalizeRoutingRule(v: unknown): ByokRoutingRule | null {
@@ -60,6 +51,8 @@ function normalizeConfigV2(v: unknown): ByokConfigV2 {
   const enabled = typeof r.enabled === "boolean" ? r.enabled : false;
   const proxyRaw = asRecord(r.proxy) || {};
   const proxyBaseUrl = normalizeString(proxyRaw.baseUrl);
+  const featureFlagsModeRaw = normalizeString((proxyRaw as any).featureFlagsMode ?? (proxyRaw as any).feature_flags_mode);
+  const featureFlagsMode = featureFlagsModeRaw === "passthrough" ? "passthrough" : featureFlagsModeRaw === "safe" ? "safe" : undefined;
   const providersRaw = Array.isArray(r.providers) ? (r.providers as unknown[]) : [];
   const providers = providersRaw.map(normalizeProvider).filter(Boolean) as ByokProvider[];
   const routingRaw = asRecord(r.routing) || {};
@@ -74,7 +67,7 @@ function normalizeConfigV2(v: unknown): ByokConfigV2 {
       )
     : undefined;
   const outRules = rules && Object.keys(rules).length ? rules : undefined;
-  return { version: 2, enabled, proxy: { baseUrl: proxyBaseUrl }, providers, routing: { activeProviderId, rules: outRules } };
+  return { version: 2, enabled, proxy: { baseUrl: proxyBaseUrl, featureFlagsMode }, providers, routing: { activeProviderId, rules: outRules } };
 }
 
 function secretKey(providerId: string, field: keyof ByokProviderSecrets): string {
@@ -154,7 +147,7 @@ export async function loadByokConfigResolved({ context, env = process.env }: { c
   );
   return {
     ...config,
-    proxy: { baseUrl: normalizeString(config.proxy?.baseUrl), token: proxyToken || undefined },
+    proxy: { baseUrl: normalizeString(config.proxy?.baseUrl), token: proxyToken || undefined, featureFlagsMode: config.proxy?.featureFlagsMode },
     providers
   };
 }

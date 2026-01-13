@@ -11,6 +11,7 @@ const { patchUpstreamConfigOverride } = require("../../mol/vsix-patch-set/patch-
 const { patchPromptEnhancerThirdPartyOverride } = require("../../mol/vsix-patch-set/patch-prompt-enhancer-third-party-override");
 const { patchSecretsLocalStore } = require("../../mol/vsix-patch-set/patch-secrets-local-store");
 const { patchLlmEndpointRouter } = require("../../mol/vsix-patch-set/patch-llm-endpoint-router");
+const { patchNoncriticalEndpointsBlocked } = require("../../mol/vsix-patch-set/patch-noncritical-endpoints-blocked");
 const { patchSettingsMemoriesWebview } = require("../../mol/vsix-patch-set/patch-settings-memories");
 const { patchSettingsSecretsWebview } = require("../../mol/vsix-patch-set/patch-settings-secrets");
 const { patchPackageJsonByokPanelCommand } = require("../../mol/vsix-patch-set/patch-package-json-byok-panel-command");
@@ -68,6 +69,9 @@ async function main() {
 
   console.log(`[build] patch LLM endpoint router`);
   patchLlmEndpointRouter(path.join(extensionDir, "out", "extension.js"), { llmEndpoints: readJson(path.join(repoRoot, "config", "byok-routing", "llm-endpoints.json"))?.endpoints });
+
+  console.log(`[build] block noncritical telemetry/notifications endpoints (BYOK mode)`);
+  patchNoncriticalEndpointsBlocked(path.join(extensionDir, "out", "extension.js"));
 
   console.log(`[build] patch secrets local store`);
   patchSecretsLocalStore(path.join(extensionDir, "out", "extension.js"));

@@ -283,11 +283,16 @@ export async function* anthropicStreamEvents({
     throw new Error(`Anthropic stream 请求失败: ${resp.status} ${text.slice(0, 200)}`.trim());
   }
 
+  let usageInputTokens: number | undefined;
+  let usageOutputTokens: number | undefined;
+  let usageCacheReadInputTokens: number | undefined;
+  let usageCacheCreationInputTokens: number | undefined;
   let thinkingBuf = "";
-  const toolUses: Array<{ toolUseId: string; toolName: string; inputJson: string }> = [];
+  let inThinkingBlock = false;
   let toolUseId = "";
   let toolName = "";
   let toolInputBuf = "";
+  let toolUseSeq = 0;
   for await (const ev of parseSse(resp)) {
     const data = ev.data;
     if (!data) continue;
@@ -297,14 +302,34 @@ export async function* anthropicStreamEvents({
     } catch {
       continue;
     }
-    if (json?.type === "content_block_delta" && json?.delta?.type === "thinking_delta" && typeof json?.delta?.thinking === "string") {
-      thinkingBuf += json.delta.thinking;
+
+    const usage = json?.message?.usage ?? json?.usage;
+    if (usage && typeof usage === "object") {
+      const inputTokens = Number((usage as any).input_tokens ?? (usage as any).inputTokens);
+      const outputTokens = Number((usage as any).output_tokens ?? (usage as any).outputTokens);
+      const cacheReadInputTokens = Number((usage as any).cache_read_input_tokens ?? (usage as any).cacheReadInputTokens);
+      const cacheCreationInputTokens = Number((usage as any).cache_creation_input_tokens ?? (usage as any).cacheCreationInputTokens);
+      if (Number.isFinite(inputTokens)) usageInputTokens = inputTokens;
+      if (Number.isFinite(outputTokens)) usageOutputTokens = outputTokens;
+      if (Number.isFinite(cacheReadInputTokens)) usageCacheReadInputTokens = cacheReadInputTokens;
+      if (Number.isFinite(cacheCreationInputTokens)) usageCacheCreationInputTokens = cacheCreationInputTokens;
+    }
+    if (json?.type === "content_block_start" && json?.content_block?.type === "thinking") {
+      inThinkingBlock = true;
+      thinkingBuf = "";
+    }
+    if (json?.type === "content_block_delta" && json?.delta?.type === "thinking_delta" && typeof json?.delta?.thinking === "string") thinkingBuf += json.delta.thinking;
+    if (json?.type === "content_block_stop" && inThinkingBlock) {
+      inThinkingBlock = false;
+      if (thinkingBuf.trim()) {
+        yield { kind: "thinking", summary: thinkingBuf };
+        thinkingBuf = "";
+      }
     }
     if (json?.type === "content_block_start" && json?.content_block?.type === "tool_use") {
       toolUseId = normalizeString(json?.content_block?.id);
       toolName = normalizeString(json?.content_block?.name);
-      const input = json?.content_block?.input;
-      toolInputBuf = input && typeof input === "object" ? JSON.stringify(input) : "";
+      toolInputBuf = "";
     }
     if (json?.type === "content_block_delta" && json?.delta?.type === "input_json_delta") {
       const part = json?.delta?.partial_json ?? json?.delta?.partialJson ?? json?.delta?.input_json ?? json?.delta?.inputJson;
@@ -312,14 +337,14 @@ export async function* anthropicStreamEvents({
     }
     if (json?.type === "content_block_stop" && toolName) {
       const now = Date.now();
-      const id = toolUseId || `byok-tool-${now}-${toolUses.length}`;
+      const id = toolUseId || `byok-tool-${now}-${toolUseSeq++}`;
       const inputJson = normalizeString(toolInputBuf) || "{}";
       try {
         JSON.parse(inputJson);
       } catch {
         throw new Error(`Tool(${toolName}) input_json 不是合法 JSON: ${inputJson.slice(0, 200)}`);
       }
-      toolUses.push({ toolUseId: id, toolName, inputJson });
+      yield { kind: "tool_use", toolUseId: id, toolName, inputJson };
       toolUseId = "";
       toolName = "";
       toolInputBuf = "";
@@ -327,7 +352,8 @@ export async function* anthropicStreamEvents({
     if (json?.type === "content_block_delta" && json?.delta?.type === "text_delta" && typeof json?.delta?.text === "string") yield { kind: "text", text: json.delta.text };
   }
   if (thinkingBuf.trim()) yield { kind: "thinking", summary: thinkingBuf };
-  for (const tu of toolUses) yield { kind: "tool_use", toolUseId: tu.toolUseId, toolName: tu.toolName, inputJson: tu.inputJson };
+  if (usageInputTokens != null || usageOutputTokens != null || usageCacheReadInputTokens != null || usageCacheCreationInputTokens != null)
+    yield { kind: "token_usage", inputTokens: usageInputTokens, outputTokens: usageOutputTokens, cacheReadInputTokens: usageCacheReadInputTokens, cacheCreationInputTokens: usageCacheCreationInputTokens };
 }
 
 export async function* anthropicStream(args: Parameters<typeof anthropicStreamEvents>[0]): AsyncGenerator<string> {
@@ -338,12 +364,14 @@ export async function anthropicListModels({
   baseUrl,
   apiKey,
   timeoutMs,
-  abortSignal
+  abortSignal,
+  extraHeaders
 }: {
   baseUrl: string;
   apiKey: string;
   timeoutMs: number;
   abortSignal?: AbortSignal;
+  extraHeaders?: Record<string, string>;
 }): Promise<string[]> {
   const url = joinBaseUrl(baseUrl, "models");
   if (!url) throw new Error("Anthropic baseUrl 无效");
@@ -354,7 +382,7 @@ export async function anthropicListModels({
     url,
     {
       method: "GET",
-      headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
+      headers: { ...(extraHeaders || {}), "x-api-key": key, "anthropic-version": "2023-06-01", authorization: `Bearer ${key}` },
       signal: buildAbortSignal(timeoutMs, abortSignal)
     },
     "Anthropic"
