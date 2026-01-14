@@ -86,15 +86,14 @@ function isChatEndpoint(endpoint: string): boolean {
   return endpoint === "chat" || endpoint === "chat-stream";
 }
 
-function getRoutingRule(cfg: ByokResolvedConfigV2, endpoint: string): ByokRoutingRule | null {
+function getRoutingRule(cfg: { routing?: { rules?: Record<string, ByokRoutingRule> } }, endpoint: string): ByokRoutingRule | null {
   const rules = cfg.routing?.rules && typeof cfg.routing.rules === "object" ? cfg.routing.rules : null;
   const v = rules && typeof (rules as any)[endpoint] === "object" ? (rules as any)[endpoint] : null;
   return v ? (v as ByokRoutingRule) : null;
 }
 
-function throwIfDisabledEndpoint(cfg: ByokResolvedConfigV2, endpoint: string): void {
-  const rule = getRoutingRule(cfg, endpoint);
-  if (rule?.enabled === false) throw new Error(`BYOK 已禁用的 endpoint: ${endpoint}`);
+function isEndpointDisabled(cfg: { routing?: { rules?: Record<string, ByokRoutingRule> } }, endpoint: string): boolean {
+  return getRoutingRule(cfg, endpoint)?.enabled === false;
 }
 
 function parseByokModelId(model: string): { providerId: string; modelId: string } | null {
@@ -163,22 +162,23 @@ function buildSystemText(body: Record<string, any>): string {
 }
 
 function buildUserText(body: Record<string, any>): string {
-  const parts: string[] = [];
-  const add = (label: string, v: any) => {
-    const s = typeof v === "string" ? v : v == null ? "" : String(v);
-    if (!s.trim()) return;
-    parts.push(`${label}:\n${s.trim()}`);
-  };
-  add("Path", body.path);
-  add("Language", body.lang);
-  add("Instruction", body.instruction);
+  const hasNodes = Array.isArray(body.nodes) && body.nodes.some((x) => x && typeof x === "object");
   const message = normalizeString(body.message);
-  if (message && !isUserPlaceholderMessage(message)) add("Message", message);
-  add("Prompt", body.prompt);
-  add("Prefix", body.prefix);
-  add("Selected Text", body.selected_text ?? body.selected_code);
-  add("Suffix", body.suffix);
-  add("Diff", body.diff);
+  const prompt = normalizeString(body.prompt);
+  const instruction = normalizeString(body.instruction);
+  const useMessage = message && !isUserPlaceholderMessage(message);
+  const usePrompt = !useMessage && Boolean(prompt);
+  const main = useMessage ? message : usePrompt ? prompt : instruction;
+  const parts: string[] = [];
+  if (main) parts.push(main);
+  if (hasNodes || usePrompt) return parts.join("\n\n").trim();
+  const prefix = normalizeString(body.prefix);
+  const selected = normalizeString(body.selected_text ?? body.selected_code);
+  const suffix = normalizeString(body.suffix);
+  const code = normalizeString(`${prefix}${selected}${suffix}`);
+  if (code && code !== normalizeString(main)) parts.push(code);
+  const diff = normalizeString(body.diff);
+  if (diff && diff !== code && diff !== normalizeString(main)) parts.push(diff);
   return parts.join("\n\n").trim();
 }
 
@@ -526,19 +526,18 @@ function formatHistorySummaryForPrompt(v: unknown): string {
 
 function buildUserContentItemsFromTextAndNodes({ text, nodes }: { text: string; nodes: any[] }): UserContentItem[] {
   const items: UserContentItem[] = [];
-  let lastText = "";
+  const seenText = new Set<string>();
   const pushText = (v: unknown) => {
     const s = normalizeString(v);
     if (!s || isUserPlaceholderMessage(s)) return;
-    if (normalizeString(lastText) === s) return;
+    if (seenText.has(s)) return;
     items.push({ kind: "text", text: s });
-    lastText = s;
+    seenText.add(s);
   };
   const pushImage = ({ data, format }: { data: unknown; format: unknown }) => {
     const imageData = normalizeString(data);
     if (!imageData) return;
     items.push({ kind: "image", mimeType: mapImageFormatToMimeType(Number(format)), data: imageData });
-    lastText = "";
   };
 
   pushText(text);
@@ -612,13 +611,13 @@ function toOpenAiUserContent(items: UserContentItem[]): string | any[] {
 
 function buildAnthropicUserContentBlocksFromTextAndNodes({ text, nodes, includeToolResults }: { text: string; nodes: any[]; includeToolResults: boolean }): any[] {
   const blocks: any[] = [];
-  let lastText = "";
+  const seenText = new Set<string>();
   const pushText = (v: unknown) => {
     const s = normalizeString(v);
     if (!s || isUserPlaceholderMessage(s)) return;
-    if (normalizeString(lastText) === s) return;
+    if (seenText.has(s)) return;
     blocks.push({ type: "text", text: s });
-    lastText = s;
+    seenText.add(s);
   };
 
   pushText(text);
@@ -643,7 +642,6 @@ function buildAnthropicUserContentBlocksFromTextAndNodes({ text, nodes, includeT
       }
       const content: any = contentBlocks.length ? contentBlocks : fallbackText;
       blocks.push({ type: "tool_result", tool_use_id: toolUseId, content, is_error: normalizeIsErrorFlag(tr.is_error ?? tr.isError) });
-      lastText = "";
       continue;
     }
     if (t === 2) {
@@ -651,7 +649,6 @@ function buildAnthropicUserContentBlocksFromTextAndNodes({ text, nodes, includeT
       const data = normalizeString(img.image_data ?? img.imageData);
       if (!data) continue;
       blocks.push({ type: "image", source: { type: "base64", media_type: mapImageFormatToMimeType(Number(img.format)), data } });
-      lastText = "";
       continue;
     }
     if (t === 3) {
@@ -1080,10 +1077,11 @@ function getContextOrThrow(): any {
   return ctx;
 }
 
-async function getConfigIfEnabled(): Promise<ByokResolvedConfigV2 | null> {
+async function getConfigIfEndpointEnabled(endpoint: string): Promise<ByokResolvedConfigV2 | null> {
   const context = getContextOrThrow();
   const raw = await loadByokConfigRaw({ context });
   if (raw.enabled !== true) return null;
+  if (isEndpointDisabled(raw, endpoint)) return null;
   return await loadByokConfigResolved({ context });
 }
 
@@ -1115,8 +1113,8 @@ export async function maybeHandleCallApi({
     const ctx = getContextOrThrow();
     const raw = await loadByokConfigRaw({ context: ctx });
     if (raw.enabled !== true) return undefined;
+    if (isEndpointDisabled(raw, ep)) return undefined;
     const cfg = await loadByokConfigResolved({ context: ctx });
-    throwIfDisabledEndpoint(cfg, ep);
     const baseUrl = normalizeString(cfg.proxy.baseUrl) || normalizeString(upstreamBaseUrl);
     const token = normalizeString(cfg.proxy.token || "") || normalizeString(upstreamApiToken);
     let upstream: any = null;
@@ -1238,9 +1236,8 @@ export async function maybeHandleCallApi({
     const base = upstream && typeof upstream === "object" ? upstream : { default_model: "", feature_flags: {}, languages: [], models: [], user: {}, user_tier: "unknown" };
     return transform({ ...base, default_model: agentChatModel, models, feature_flags });
   }
-  const cfg = await getConfigIfEnabled();
+  const cfg = await getConfigIfEndpointEnabled(ep);
   if (!cfg) return undefined;
-  throwIfDisabledEndpoint(cfg, ep);
   if (ep === "next_edit_loc") {
     const instruction = normalizeString(request.instruction);
     const path = normalizeString(request.path);
@@ -1329,12 +1326,11 @@ export async function maybeHandleCallApiStream({
   abortSignal?: AbortSignal;
 }): Promise<AsyncGenerator<any> | undefined> {
   const ep = normalizeEndpoint(endpoint);
-  const cfg = await getConfigIfEnabled();
+  const cfg = await getConfigIfEndpointEnabled(ep);
   if (!cfg) return undefined;
-  throwIfDisabledEndpoint(cfg, ep);
   const request = (asRecord(body) as any) || {};
   const system = buildSystemText(request);
-  const user = buildUserText(request);
+  let user = buildUserText(request);
   const tmo = BYOK_REQUEST_TIMEOUT_MS;
   const requestModel = normalizeString(request.model || request.model_id || request.modelId);
   const resolved = resolveProviderAndModel(cfg, ep, requestModel);
@@ -1371,8 +1367,20 @@ export async function maybeHandleCallApiStream({
 
   if (ep === "chat-stream") {
     const toolDefs = getToolDefinitions(request);
-    const chatHistory = getChatHistory(request);
-    const requestNodes = getRequestNodes(request);
+    let chatHistory = getChatHistory(request);
+    let requestNodes = getRequestNodes(request);
+    const last = chatHistory.length ? ((asRecord(chatHistory[chatHistory.length - 1]) as any) || null) : null;
+    if (last) {
+      const lastOutputNodes = getExchangeOutputNodes(last);
+      const lastHasAssistant = Boolean(getExchangeAssistantText(last)) || extractToolUsesFromOutputNodes(lastOutputNodes).length > 0;
+      if (!lastHasAssistant) {
+        const lastUserText = getExchangeUserText(last);
+        const lastRequestNodes = getExchangeRequestNodes(last);
+        chatHistory = chatHistory.slice(0, -1);
+        if (!normalizeString(user) && lastUserText) user = lastUserText;
+        if (lastRequestNodes.length) requestNodes = [...lastRequestNodes, ...requestNodes];
+      }
+    }
 
     const provider = resolvedProvider;
     const model = resolvedModel;
