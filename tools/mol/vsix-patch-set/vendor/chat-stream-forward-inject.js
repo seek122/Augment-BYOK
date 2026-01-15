@@ -1,9 +1,8 @@
 // === Chat-Stream Forward Interceptor（VS Code Settings）===
 // 仅拦截 Augment 的 /chat-stream 并转发到你配置的代理（上游域名以 completionURL/实际请求为准，避免写死官方域名列表）。
 // 配置来源：VS Code Settings（augment.advanced.chatStreamForward）
-// - 只需要配置：api_url（必填）
-// - 不回落官方：未配置 / 配置非法 → 直接返回 NDJSON 错误
-// - api_url：只需要写到端口（如 http://127.0.0.1:8317），会自动补为 /chat-stream（不要写路径）
+// - 仅当 `globalThis.__augment_byok_upstream_config_override.enabled === true` 且配置存在且合法时启用；否则 passthrough（不影响原生请求）
+// - api_url：支持 baseUrl（如 http://127.0.0.1:8317 或 http://127.0.0.1:8317/v1）或完整 chat-stream URL（如 http://127.0.0.1:8317/chat-stream）
 // - debug：默认固定开启（不读配置项）
 
 (function () {
@@ -15,6 +14,10 @@
 
     let _configCache = null;
     let _configLoadTime = 0;
+
+    function isByokEnabled() {
+        try { return !!(globalThis && globalThis.__augment_byok_upstream_config_override && globalThis.__augment_byok_upstream_config_override.enabled === true); } catch (_) { return false; }
+    }
 
     function tryLoadConfigFromVscode() {
         try {
@@ -38,26 +41,13 @@
         return cfg;
     }
 
-    async function getConfig() {
-        try {
-            const cfg = tryLoadConfigFromVscode();
-            if (!cfg) throw new Error("未找到转发配置：请在 VS Code Settings 中设置 augment.advanced.chatStreamForward.api_url");
-            _configCache = cfg;
-            _configLoadTime = Date.now();
-            return cfg;
-        } catch (e) {
-            throw new Error(`VS Code Settings 配置读取失败: ${e && e.message ? e.message : String(e)}`);
-        }
-    }
-
     function log(level, ...args) {
         console[level]("[ChatStreamForward]", ...args);
     }
 
     function validateConfig(cfg) {
         if (!cfg || typeof cfg !== "object") throw new Error("配置为空或不是 object");
-        normalizeApiUrlToChatStream(cfg.api_url);
-        return true;
+        return normalizeApiUrlToChatStream(cfg.api_url);
     }
 
     function normalizeApiUrlToChatStream(apiUrl) {
@@ -66,10 +56,12 @@
         let u;
         try { u = new URL(raw); } catch (e) { throw new Error(`api_url 不是合法 URL: ${e && e.message ? e.message : String(e)}`); }
         if (!/^https?:$/i.test(u.protocol)) throw new Error("api_url 必须是 http/https");
-        if (normalizePathname(u.pathname) !== "") throw new Error("api_url 只需要配置到端口（不要包含路径），例如：http://127.0.0.1:8317");
         if (u.search) throw new Error("api_url 不要包含 query 参数");
         if (u.hash) throw new Error("api_url 不要包含 hash");
-        return new URL("chat-stream", new URL(u.origin)).toString();
+        const p0 = normalizePathname(u.pathname);
+        if (!p0) return new URL("chat-stream", new URL(u.origin + "/")).toString();
+        if (p0.endsWith(CHAT_STREAM_PATH)) return new URL(u.origin + p0).toString();
+        return new URL("chat-stream", new URL(u.origin + p0 + "/")).toString();
     }
 
     function tryLoadCompletionUrlFromVscode() {
@@ -230,13 +222,17 @@
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async function (url, options) {
+        if (!isByokEnabled()) return originalFetch.apply(this, arguments);
         if (!isChatStreamFetchToCurrentCompletionUrl(url, options)) return originalFetch.apply(this, arguments);
 
+        const cfg = getConfigSync();
+        if (!cfg) return originalFetch.apply(this, arguments);
+
+        let forwardUrl;
+        try { forwardUrl = validateConfig(cfg); } catch (e) { log("warn", "配置缺失/非法，chat-stream-forward passthrough:", e && e.message ? e.message : String(e)); return originalFetch.apply(this, arguments); }
+
         try {
-            const cfg = await getConfig();
-            validateConfig(cfg);
             const urlStr = normalizeFetchUrlToString(url) || String(url || "");
-            const forwardUrl = normalizeApiUrlToChatStream(cfg.api_url);
             if (isSameUrlLoose(urlStr, forwardUrl)) throw new Error("转发目标 api_url 与当前请求 URL 相同，拒绝转发（避免递归）");
 
             log("info", "=== Fetch 拦截到 chat-stream 请求 ===");
@@ -257,17 +253,22 @@
     };
 
     globalThis._chatStreamFetchIntercepted = true;
-    console.log("[ChatStreamForward] ✅ Fetch 拦截器已安装");
+    console.log("[ChatStreamForward] ✅ Fetch 拦截器已安装（BYOK enabled + 配置门控）");
 
     const cfg0 = getConfigSync();
     if (cfg0) {
-        console.log("[ChatStreamForward] ✅ 配置已加载");
-        if (cfg0.__source) console.log("[ChatStreamForward] 配置来源:", cfg0.__source);
-        console.log("[ChatStreamForward] 转发地址:", normalizeApiUrlToChatStream(cfg0.api_url));
+        try {
+            const forwardUrl0 = validateConfig(cfg0);
+            console.log("[ChatStreamForward] ✅ 配置已加载（仅 BYOK enabled 时生效）");
+            if (cfg0.__source) console.log("[ChatStreamForward] 配置来源:", cfg0.__source);
+            console.log("[ChatStreamForward] 转发地址:", forwardUrl0);
+        } catch (e) {
+            console.warn("[ChatStreamForward] ⚠️ 配置非法，将 passthrough:", e && e.message ? e.message : String(e));
+        }
     } else {
-        console.warn("[ChatStreamForward] ⚠️ 未找到转发配置：请在 VS Code Settings 中设置 augment.advanced.chatStreamForward");
+        console.log("[ChatStreamForward] ℹ️ 未找到转发配置，将 passthrough（不影响原生请求）");
     }
 
-    console.log("[ChatStreamForward] ✅ 初始化完成 - chat-stream 拦截已启用（以 completionURL 同源 + 实际 chat-stream 路径为准）");
+    console.log("[ChatStreamForward] ✅ 初始化完成 - chat-stream forward 已就绪（以 completionURL 同源 + 实际 chat-stream 路径为准）");
 })();
 // === Chat-Stream Forward Interceptor End ===
